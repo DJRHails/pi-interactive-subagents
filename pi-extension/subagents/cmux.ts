@@ -3,6 +3,49 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import * as log from "./log.js";
+
+const LOG = "cmux";
+
+/**
+ * Shape of `cmux --json tree` output (only the fields we use).
+ * See `cmux tree --help` for the full schema.
+ */
+interface CmuxTreeSurface { ref: string; pane_ref: string; }
+interface CmuxTreePane { ref: string; surfaces: CmuxTreeSurface[]; }
+interface CmuxTreeWorkspace { panes: CmuxTreePane[]; }
+interface CmuxTreeWindow { workspaces: CmuxTreeWorkspace[]; }
+interface CmuxTree { windows: CmuxTreeWindow[]; }
+
+/** Shape of `cmux --json new-split` / `new-surface` responses. */
+interface CmuxNewSurfaceResponse { surface_ref: string; pane_ref: string; }
+
+/** Run a cmux command with `--json` and parse the response. Throws on parse failure. */
+function cmuxJson<T>(args: string): T {
+  const cmd = `cmux --json ${args}`;
+  const out = execSync(cmd, { encoding: "utf8" }).trim();
+  try {
+    return JSON.parse(out) as T;
+  } catch (e) {
+    log.error(LOG, `failed to parse JSON from \`${cmd}\``, { out, error: e });
+    throw new Error(`cmux returned non-JSON output for \`${cmd}\`: ${out}`);
+  }
+}
+
+/** Return true if `pane` currently exists in the cmux tree. */
+function cmuxPaneExists(pane: string): boolean {
+  try {
+    const tree = cmuxJson<CmuxTree>("tree");
+    for (const w of tree.windows)
+      for (const ws of w.workspaces)
+        for (const p of ws.panes)
+          if (p.ref === pane) return true;
+    return false;
+  } catch (e) {
+    log.warn(LOG, "cmuxPaneExists: tree query failed", e);
+    return false;
+  }
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -189,31 +232,38 @@ export function createSurface(name: string): string {
   const backend = getMuxBackend();
 
   if (backend === "cmux" && cmuxSubagentPane) {
-    // Verify the pane still exists before adding a tab to it
-    try {
-      const tree = execSync(`cmux tree`, { encoding: "utf8" });
-      if (tree.includes(cmuxSubagentPane)) {
+    if (cmuxPaneExists(cmuxSubagentPane)) {
+      log.debug(LOG, `reusing tracked subagent pane ${cmuxSubagentPane} for "${name}"`);
+      try {
         return createSurfaceInPane(name, cmuxSubagentPane);
+      } catch (e) {
+        log.warn(LOG, `createSurfaceInPane failed for ${cmuxSubagentPane}; falling back to split`, e);
       }
-    } catch {}
-    // Pane is gone — fall through to create a new split
+    } else {
+      log.debug(LOG, `tracked subagent pane ${cmuxSubagentPane} no longer exists; creating a new split`);
+    }
     cmuxSubagentPane = null;
   }
 
+  // First subagent (or after fallback): split off a new pane and remember it.
+  // We deliberately read pane_ref from the new-split response itself — `cmux identify
+  // --surface <s>` returns nulls because it sets *caller context* rather than
+  // describing the surface, and walking `cmux tree` is unnecessary when the response
+  // already contains pane_ref.
   const surface = createSurfaceSplit(name, "right");
 
-  // For cmux, remember the pane so future subagents become tabs in it
   if (backend === "cmux") {
-    try {
-      const info = execSync(`cmux identify --surface ${shellEscape(surface)}`, {
-        encoding: "utf8",
-      });
-      const parsed = JSON.parse(info);
-      const paneRef = parsed?.caller?.pane_ref;
-      if (paneRef) {
-        cmuxSubagentPane = paneRef;
-      }
-    } catch {}
+    if (lastCmuxSplitPane) {
+      cmuxSubagentPane = lastCmuxSplitPane;
+      log.debug(LOG, `tracking new subagent pane ${cmuxSubagentPane} (surface ${surface})`);
+    } else {
+      log.warn(
+        LOG,
+        `createSurfaceSplit returned surface ${surface} but no pane_ref was captured; ` +
+          `tab-reuse disabled — subsequent subagents will recursively split`,
+      );
+    }
+    lastCmuxSplitPane = null;
   }
 
   return surface;
@@ -223,19 +273,22 @@ export function createSurface(name: string): string {
  * Create a new surface (tab) in an existing cmux pane.
  */
 function createSurfaceInPane(name: string, pane: string): string {
-  const out = execSync(`cmux new-surface --pane ${shellEscape(pane)}`, {
-    encoding: "utf8",
-  }).trim();
-  const match = out.match(/surface:\d+/);
-  if (!match) {
-    throw new Error(`Unexpected cmux new-surface output: ${out}`);
+  const resp = cmuxJson<CmuxNewSurfaceResponse>(`new-surface --pane ${shellEscape(pane)}`);
+  if (!resp.surface_ref) {
+    throw new Error(`cmux new-surface returned no surface_ref: ${JSON.stringify(resp)}`);
   }
-  const surface = match[0];
-  execSync(`cmux rename-tab --surface ${shellEscape(surface)} ${shellEscape(name)}`, {
+  execSync(`cmux rename-tab --surface ${shellEscape(resp.surface_ref)} ${shellEscape(name)}`, {
     encoding: "utf8",
   });
-  return surface;
+  log.debug(LOG, `created tab surface ${resp.surface_ref} in pane ${pane} ("${name}")`);
+  return resp.surface_ref;
 }
+
+/**
+ * Pane ref captured from the most recent `createSurfaceSplit` call on cmux.
+ * Read by `createSurface` to remember the subagent pane without an extra round-trip.
+ */
+let lastCmuxSplitPane: string | null = null;
 
 /**
  * Create a new split in the given direction from an optional source pane.
@@ -250,18 +303,19 @@ export function createSurfaceSplit(
 
   if (backend === "cmux") {
     const surfaceArg = fromSurface ? ` --surface ${shellEscape(fromSurface)}` : "";
-    const out = execSync(`cmux new-split ${direction}${surfaceArg}`, {
-      encoding: "utf8",
-    }).trim();
-    const match = out.match(/surface:\d+/);
-    if (!match) {
-      throw new Error(`Unexpected cmux new-split output: ${out}`);
+    const resp = cmuxJson<CmuxNewSurfaceResponse>(`new-split ${direction}${surfaceArg}`);
+    if (!resp.surface_ref) {
+      throw new Error(`cmux new-split returned no surface_ref: ${JSON.stringify(resp)}`);
     }
-    const surface = match[0];
-    execSync(`cmux rename-tab --surface ${shellEscape(surface)} ${shellEscape(name)}`, {
+    lastCmuxSplitPane = resp.pane_ref ?? null;
+    execSync(`cmux rename-tab --surface ${shellEscape(resp.surface_ref)} ${shellEscape(name)}`, {
       encoding: "utf8",
     });
-    return surface;
+    log.debug(
+      LOG,
+      `new-split ${direction}${fromSurface ? ` from ${fromSurface}` : ""} -> surface ${resp.surface_ref} in pane ${resp.pane_ref ?? "?"}`,
+    );
+    return resp.surface_ref;
   }
 
   if (backend === "tmux") {
