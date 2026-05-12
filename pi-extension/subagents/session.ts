@@ -94,6 +94,11 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
 
 /**
  * Find the last assistant message text in a list of entries.
+ *
+ * Falls back to the `errorMessage` field when the last assistant message has
+ * `stopReason: "error"` and no usable text content — this happens when
+ * auto-retry exhausts on a provider overload / rate limit / server error, and
+ * without this fallback the parent would silently see a stale earlier message.
  */
 export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -110,6 +115,16 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
       .map((block) => block.text as string);
 
     if (texts.length > 0 && texts.join("").trim()) return texts.join("\n");
+
+    const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
+    const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
+    if (
+      stopReason === "error" &&
+      typeof errorMessage === "string" &&
+      errorMessage.trim() !== ""
+    ) {
+      return `Subagent error: ${errorMessage.trim()}`;
+    }
   }
   return null;
 }

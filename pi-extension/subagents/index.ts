@@ -437,12 +437,29 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 }
 
 function resolveResultPresentation(
-  result: Pick<SubagentResult, "exitCode" | "elapsed" | "summary" | "sessionFile">,
+  result: Pick<
+    SubagentResult,
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage"
+  >,
   name: string,
 ): string {
   const sessionRef = result.sessionFile
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
+
+  if (result.errorMessage) {
+    // Auto-retry exhausted or other agent-loop error. The subagent did not
+    // produce a usable result — surface the underlying provider/network
+    // failure so the orchestrator can decide whether to retry, resume, or
+    // change approach instead of silently treating the run as completed.
+    return (
+      `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
+      `(provider/agent error — auto-retry exhausted).\n\n` +
+      `Error: ${result.errorMessage}\n\n` +
+      `The subagent did not produce a result. You can retry by spawning a new ` +
+      `subagent or resume the session with subagent_resume.${sessionRef}`
+    );
+  }
 
   return result.exitCode !== 0
     ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
@@ -461,6 +478,8 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
+  /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
+  errorMessage?: string;
   ping?: { name: string; message: string };
 }
 
@@ -893,6 +912,7 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
+  formatElapsed,
 };
 
 function startWidgetRefresh() {
@@ -1277,18 +1297,21 @@ async function watchSubagent(
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
-    // Pi subagent result extraction (existing, unchanged)
+    // Pi subagent result extraction
     let summary: string;
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
       summary =
         findLastAssistantMessage(allEntries) ??
-        (result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output");
+        (result.errorMessage
+          ? `Subagent error: ${result.errorMessage}`
+          : result.exitCode !== 0
+            ? `Sub-agent exited with code ${result.exitCode}`
+            : "Sub-agent exited without output");
     } else {
-      summary =
-        result.exitCode !== 0
+      summary = result.errorMessage
+        ? `Subagent error: ${result.errorMessage}`
+        : result.exitCode !== 0
           ? `Sub-agent exited with code ${result.exitCode}`
           : "Sub-agent exited without output";
     }
@@ -1304,6 +1327,7 @@ async function watchSubagent(
       exitCode: result.exitCode,
       elapsed,
       ping: result.ping,
+      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
     try {
@@ -1473,6 +1497,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
+                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                 },
               },
@@ -1885,9 +1910,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
             const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
-              (result.exitCode !== 0
-                ? `Resumed session exited with code ${result.exitCode}`
-                : "Resumed session exited without new output");
+              (result.errorMessage
+                ? `Subagent error: ${result.errorMessage}`
+                : result.exitCode !== 0
+                  ? `Resumed session exited with code ${result.exitCode}`
+                  : "Resumed session exited without new output");
             const presentation = resolveResultPresentation(
               { ...result, summary, sessionFile: params.sessionPath },
               name,
@@ -1904,6 +1931,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
+                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -1986,16 +2014,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
+        const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
+        const failed = exitCode !== 0 || !!errorMessage;
         const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
-        const bgFn = exitCode === 0
-          ? (text: string) => theme.bg("toolSuccessBg", text)
-          : (text: string) => theme.bg("toolErrorBg", text);
-        const icon = exitCode === 0
-          ? theme.fg("success", "✓")
-          : theme.fg("error", "✗");
-        const status = exitCode === 0
-          ? "completed"
-          : `failed (exit ${exitCode})`;
+        const bgFn = failed
+          ? (text: string) => theme.bg("toolErrorBg", text)
+          : (text: string) => theme.bg("toolSuccessBg", text);
+        const icon = failed
+          ? theme.fg("error", "✗")
+          : theme.fg("success", "✓");
+        const status = errorMessage
+          ? "failed (provider/agent error)"
+          : failed
+            ? `failed (exit ${exitCode})`
+            : "completed";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
 
         const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;
@@ -2005,7 +2037,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const summary = rawContent
           .replace(/\n\nSession: .+\nResume: .+$/, "")
           .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
-          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "");
+          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
+          .replace(
+            new RegExp(
+              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,
+            ),
+            "",
+          );
 
         // Build content for the box
         const contentLines = [header];

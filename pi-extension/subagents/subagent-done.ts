@@ -20,6 +20,11 @@ export function shouldAutoExitOnAgentEnd(
   // Manual input should not strand an auto-exit subagent. If the latest agent
   // turn completed normally, close the session. Escape/abort still leaves it
   // open for inspection or another prompt.
+  //
+  // stopReason: "error" (e.g. exhausted retries on a provider overload) also
+  // returns true — we want to shut down so the parent is woken up — but we
+  // pair this with findLatestAssistantError() so the parent learns it was an
+  // error, not a clean completion.
   if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
@@ -30,6 +35,37 @@ export function shouldAutoExitOnAgentEnd(
   }
 
   return true;
+}
+
+export interface SubagentErrorInfo {
+  errorMessage: string;
+  stopReason: "error";
+}
+
+/**
+ * If the last assistant message in the turn ended with `stopReason: "error"`
+ * (typically auto-retry exhausted on an overload / rate limit / server error),
+ * return its error info so the parent orchestrator can surface a clear
+ * failure instead of silently treating the run as completed.
+ *
+ * Returns `null` when the latest assistant turn completed normally or was
+ * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
+ */
+export function findLatestAssistantError(
+  messages: any[] | undefined,
+): SubagentErrorInfo | null {
+  if (!messages) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role !== "assistant") continue;
+    if (msg.stopReason !== "error") return null;
+    const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
+    return {
+      errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
+      stopReason: "error",
+    };
+  }
+  return null;
 }
 
 export function parseDeniedTools(rawValue: string | undefined): string[] {
@@ -140,6 +176,29 @@ export default function (pi: ExtensionAPI) {
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
+      // Surface stopReason: "error" turns (auto-retry exhausted, provider
+      // overload, etc.) to the parent via the .exit sidecar so the watcher
+      // can report a clear failure with the underlying error message.
+      // Without this the parent would only see exit code 0 and a stale
+      // assistant message, mistaking the crash for a successful completion.
+      const errorInfo = findLatestAssistantError(messages);
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (errorInfo && sessionFile) {
+        try {
+          writeFileSync(
+            `${sessionFile}.exit`,
+            JSON.stringify({
+              type: "error",
+              errorMessage: errorInfo.errorMessage,
+              stopReason: errorInfo.stopReason,
+            }),
+          );
+        } catch {
+          // Best effort — even without the sidecar, watcher's session-file
+          // fallback can still recover the errorMessage.
+        }
+      }
+
       recorder.agentEndDone();
       ctx.shutdown();
       return;

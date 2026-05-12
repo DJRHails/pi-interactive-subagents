@@ -1217,12 +1217,39 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "ping" | "sentinel";
+  reason: "done" | "ping" | "sentinel" | "error";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Ping data if reason is "ping" */
   ping?: { name: string; message: string };
+  /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
+  errorMessage?: string;
 }
+
+/**
+ * Interpret an `.exit` sidecar payload (written by subagent_done / caller_ping /
+ * the error path in subagent-done.ts). Centralized so both the fast and slow
+ * paths in pollForExit decode the payload the same way.
+ */
+function interpretExitSidecar(data: any): PollResult {
+  if (data?.type === "ping") {
+    return {
+      reason: "ping",
+      exitCode: 0,
+      ping: { name: data.name, message: data.message },
+    };
+  }
+  if (data?.type === "error") {
+    const errorMessage =
+      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
+        ? data.errorMessage
+        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
+    return { reason: "error", exitCode: 1, errorMessage };
+  }
+  return { reason: "done", exitCode: 0 };
+}
+
+export const __pollForExitTest__ = { interpretExitSidecar };
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
@@ -1253,10 +1280,7 @@ export async function pollForExit(
         if (existsSync(exitFile)) {
           const data = JSON.parse(readFileSync(exitFile, "utf8"));
           rmSync(exitFile, { force: true });
-          if (data.type === "ping") {
-            return { reason: "ping", exitCode: 0, ping: { name: data.name, message: data.message } };
-          }
-          return { reason: "done", exitCode: 0 };
+          return interpretExitSidecar(data);
         }
       } catch {}
     }
@@ -1285,10 +1309,7 @@ export async function pollForExit(
           if (existsSync(exitFile)) {
             const data = JSON.parse(readFileSync(exitFile, "utf8"));
             rmSync(exitFile, { force: true });
-            if (data.type === "ping") {
-              return { reason: "ping", exitCode: 0, ping: { name: data.name, message: data.message } };
-            }
-            return { reason: "done", exitCode: 0 };
+            return interpretExitSidecar(data);
           }
         } catch {}
       }

@@ -52,7 +52,9 @@ import {
 import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
+  findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
 // --- Helpers ---
 
@@ -301,6 +303,61 @@ describe("session.ts", () => {
       };
       const entries = [realMsg, emptyMsg] as any[];
       assert.equal(findLastAssistantMessage(entries), "Real summary content.");
+    });
+
+    it("surfaces errorMessage when last assistant ended with stopReason=error and no text", () => {
+      // Reproduces the overload-exhaustion case: an earlier turn looked
+      // normal, then the provider went 529 and auto-retry gave up. Without
+      // the errorMessage fallback we'd return the stale earlier summary and
+      // the orchestrator would believe the subagent completed.
+      const earlierGood = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Investigating the bug..." }],
+        },
+      };
+      const overloadError = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "Anthropic 529 Overloaded after 3 retries",
+        },
+      };
+      const entries = [earlierGood, overloadError] as any[];
+      assert.equal(
+        findLastAssistantMessage(entries),
+        "Subagent error: Anthropic 529 Overloaded after 3 retries",
+      );
+    });
+
+    it("prefers text content even when an error stopReason is set", () => {
+      // If the model produced text before the error (rare but possible), we
+      // prefer the actual content over the synthetic error fallback.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Here is partial output." }],
+          stopReason: "error",
+          errorMessage: "stream interrupted",
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Here is partial output.");
+    });
+
+    it("does not invent a summary for a stop=error message with no errorMessage", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), null);
     });
   });
 
@@ -1185,6 +1242,104 @@ describe("subagent-done.ts", () => {
       const messages = [{ role: "assistant", stopReason: "aborted" }];
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
     });
+
+    it("still exits when the latest turn ended with stopReason=error", () => {
+      // Auto-exit subagents must shut down on retry-exhaustion errors so the
+      // parent is woken. The error sidecar (written separately) carries the
+      // failure detail; staying open would just strand the worker.
+      const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
+      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+    });
+  });
+
+  describe("findLatestAssistantError", () => {
+    it("returns the error info from a stopReason=error message", () => {
+      const messages = [
+        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] },
+        { role: "toolResult", content: [] },
+        { role: "assistant", stopReason: "error", errorMessage: "Anthropic 529 Overloaded" },
+      ];
+      assert.deepEqual(findLatestAssistantError(messages), {
+        errorMessage: "Anthropic 529 Overloaded",
+        stopReason: "error",
+      });
+    });
+
+    it("returns null when the latest assistant turn completed normally", () => {
+      const messages = [
+        { role: "assistant", stopReason: "error", errorMessage: "old failure" },
+        { role: "user", content: [] },
+        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+      ];
+      assert.equal(findLatestAssistantError(messages), null);
+    });
+
+    it("returns null when the latest assistant turn was aborted by the user", () => {
+      const messages = [{ role: "assistant", stopReason: "aborted" }];
+      assert.equal(findLatestAssistantError(messages), null);
+    });
+
+    it("falls back to a placeholder when stopReason=error has no errorMessage field", () => {
+      const messages = [{ role: "assistant", stopReason: "error" }];
+      const info = findLatestAssistantError(messages);
+      assert.ok(info);
+      assert.equal(info!.stopReason, "error");
+      assert.match(info!.errorMessage, /stopReason=error/);
+    });
+
+    it("returns null when messages is undefined or empty", () => {
+      assert.equal(findLatestAssistantError(undefined), null);
+      assert.equal(findLatestAssistantError([]), null);
+    });
+  });
+});
+
+describe("cmux.ts interpretExitSidecar", () => {
+  const { interpretExitSidecar } = __pollForExitTest__;
+
+  it("decodes ping payloads", () => {
+    assert.deepEqual(
+      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
+      {
+        reason: "ping",
+        exitCode: 0,
+        ping: { name: "Worker", message: "need help" },
+      },
+    );
+  });
+
+  it("decodes done payloads", () => {
+    assert.deepEqual(interpretExitSidecar({ type: "done" }), {
+      reason: "done",
+      exitCode: 0,
+    });
+  });
+
+  it("decodes error payloads and propagates the message with a non-zero exit code", () => {
+    assert.deepEqual(
+      interpretExitSidecar({
+        type: "error",
+        errorMessage: "Anthropic 529 Overloaded after 3 retries",
+        stopReason: "error",
+      }),
+      {
+        reason: "error",
+        exitCode: 1,
+        errorMessage: "Anthropic 529 Overloaded after 3 retries",
+      },
+    );
+  });
+
+  it("falls back to a placeholder when error payload has no errorMessage", () => {
+    const result = interpretExitSidecar({ type: "error" });
+    assert.equal(result.reason, "error");
+    assert.equal(result.exitCode, 1);
+    assert.match(result.errorMessage ?? "", /no errorMessage/);
+  });
+
+  it("treats unknown payload shapes as done", () => {
+    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
+    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
   });
 });
 describe("commands", () => {
@@ -1706,6 +1861,32 @@ describe("subagent interruption", () => {
     assert.match(presentation, /failed \(exit code 130\)/);
     assert.doesNotMatch(presentation, /interrupted/);
     assert.match(presentation, /Resume: pi --session/);
+  });
+
+  it("renders a clear provider/agent error when errorMessage is set", () => {
+    // Previously, an overload retry-exhaustion produced exitCode 0 with a
+    // stale summary — the orchestrator thought the subagent finished
+    // quickly. With the error sidecar plumbed through, the presentation
+    // must call out the failure, include the underlying error, and tell the
+    // orchestrator how to recover.
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 14,
+        summary: "ignored when errorMessage is present",
+        sessionFile: "/tmp/subagent.jsonl",
+        errorMessage: "Anthropic 529 Overloaded after 3 retries",
+      },
+      "Worker",
+    );
+
+    assert.match(presentation, /Sub-agent "Worker" failed/);
+    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
+    assert.match(presentation, /subagent_resume/);
+    assert.match(presentation, /Resume: pi --session/);
+    assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
   });
 });
 
