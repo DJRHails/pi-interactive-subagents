@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import * as log from "./log.js";
+import * as log from "./log.ts";
 
 const LOG = "cmux";
 
