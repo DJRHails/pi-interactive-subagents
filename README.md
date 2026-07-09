@@ -62,13 +62,14 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 5 main-session tools + 3 commands, plus 1 subagent-only tool:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagents_list`     | List available agent definitions                                                            |
+| `set_tab_title`      | Update the tab/window title to show progress through multi-phase workflows                   |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 
 | Command                    | Description                          |
@@ -402,7 +403,7 @@ Fine-grained control over individual extension tools:
 ```yaml
 ---
 name: focused-agent
-deny-tools: subagent
+deny-tools: subagent, set_tab_title
 ---
 ```
 
