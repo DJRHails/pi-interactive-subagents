@@ -1,5 +1,23 @@
 # pi-interactive-subagents
 
+> **Fork note — patch-stack workflow:**
+> This is a patch-stack fork of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), managed by [Saint-work/patch-stack-action](https://github.com/Saint-work/patch-stack-action).
+>
+> **How it works:**
+> - The `base` branch mirrors upstream `main` nightly.
+> - Each `patch/*` branch holds a single logical change rebased automatically onto `base`.
+> - The fork's `main` integrates all patches via squash-merge (commits prefixed `patch-stack:`), on top of `fork:`-prefixed infra commits.
+> - Merge conflicts during rebase are resolved automatically using Claude Code.
+>
+> **Adding a new patch:**
+> 1. `git checkout -b patch/my-feature origin/base`
+> 2. Make changes and push: `git push origin patch/my-feature`
+> 3. Create a PR targeting `base`: `gh pr create --head patch/my-feature --base base`
+>
+> **Current patches:**
+> - `patch/set-tab-title` — restores the `set_tab_title` tool upstream removed ([#2](https://github.com/DJRHails/pi-interactive-subagents/pull/2)).
+> - `patch/headless-guard` — skips tool registration when no multiplexer is live, so a headless subagent extension can own the name ([#3](https://github.com/DJRHails/pi-interactive-subagents/pull/3)).
+
 Async subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in multiplexer panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
 https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
