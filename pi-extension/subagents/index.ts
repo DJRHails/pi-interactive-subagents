@@ -1358,6 +1358,22 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  // Headless guard: every tool here spawns/manages multiplexer panes, so
+  // without a live mux (inside cmux/tmux/zellij/WezTerm — binaries alone don't
+  // count, see cmux.ts runtime checks) they can only ever answer "mux not
+  // available". Worse, registering anyway squats the `subagent` tool name: pi
+  // fails the LATER extension on a name collision, so a headless-capable
+  // subagent extension (e.g. npm pi-subagents) never loads in headless
+  // contexts (pi -p, gantry workers, CI). Detected once at load — a mux can't
+  // appear mid-session for an already-started pi process.
+  if (!isMuxAvailable()) {
+    console.error(
+      "[interactive-subagents] no terminal multiplexer session detected — " +
+        "skipping tool registration so a headless subagent extension can own the name",
+    );
+    return;
+  }
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
