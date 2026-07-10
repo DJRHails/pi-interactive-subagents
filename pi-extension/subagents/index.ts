@@ -523,6 +523,37 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
+/**
+ * Wrap a subagent launch command so the parent is ALWAYS notified when the
+ * child stops — even if the user Ctrl-D's or closes the pane, or the process
+ * crashes. A bash trap writes a fallback `.exit` sidecar (unless the child
+ * already wrote one via subagent_done) and prints the sentinel marker. Signals
+ * are converted into a normal exit so the EXIT trap runs exactly once.
+ *
+ * This covers everything except SIGKILL, which cannot be trapped; the
+ * parent-side dead-surface detection in pollForExit handles that case.
+ */
+function withExitSignal(innerCommand: string, exitFile: string): string {
+  const ef = shellEscape(exitFile);
+  return [
+    "__pi_sa_signal() {",
+    "  __rc=$?;",
+    "  if [ ! -e " + ef + " ]; then",
+    "    if [ \"$__rc\" -eq 0 ]; then",
+    "      printf '{\"type\":\"exit\",\"exitCode\":0}' > " + ef + " 2>/dev/null;",
+    "    else",
+    "      printf '{\"type\":\"exit\",\"exitCode\":%s,\"errorMessage\":\"Subagent process exited with code %s without signalling completion (pane closed or process killed).\"}' \"$__rc\" \"$__rc\" > " + ef + " 2>/dev/null;",
+    "    fi;",
+    "  fi;",
+    "  echo \"__SUBAGENT_DONE_${__rc}__\";",
+    "}",
+    "trap __pi_sa_signal EXIT;",
+    "trap 'exit 143' HUP TERM;",
+    "trap 'exit 130' INT;",
+    innerCommand,
+  ].join("\n");
+}
+
 // ── Widget management ──
 
 /** Latest ExtensionContext from session_start, used for widget updates. */
@@ -1054,7 +1085,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = withExitSignal(`${cdPrefix}${cmdParts.join(" ")}`, `${subagentSessionFile}.exit`);
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1200,7 +1231,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = withExitSignal(piCommand, `${subagentSessionFile}.exit`);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1876,7 +1907,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = withExitSignal(`${resumeEnvPrefix}${parts.join(" ")}`, `${params.sessionPath}.exit`);
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",

@@ -1441,8 +1441,29 @@ function interpretExitSidecar(data: any): PollResult {
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
+  // Fallback sidecar written by the launch-script EXIT trap (withExitSignal):
+  // the child stopped without calling subagent_done. Preserve its exit code.
+  if (data?.type === "exit") {
+    const code = Number.isInteger(data?.exitCode) ? data.exitCode : 0;
+    if (code === 0) return { reason: "done", exitCode: 0 };
+    return {
+      reason: "error",
+      exitCode: code,
+      errorMessage:
+        typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
+          ? data.errorMessage
+          : `Subagent process exited with code ${code} without signalling completion.`,
+    };
+  }
   return { reason: "done", exitCode: 0 };
 }
+
+/**
+ * How many consecutive polls the surface may be unreadable before we conclude
+ * the subagent is gone. Guards against transient mux read failures while still
+ * cleaning up when a pane is destroyed via SIGKILL (no EXIT trap can run).
+ */
+const SURFACE_GONE_GRACE_TICKS = 5;
 
 export const __pollForExitTest__ = { interpretExitSidecar };
 
@@ -1462,6 +1483,7 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  let surfaceGoneStreak = 0;
 
   for (;;) {
     if (signal.aborted) {
@@ -1496,8 +1518,11 @@ export async function pollForExit(
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
+      // Surface is readable → the subagent is still alive. Reset the strike count.
+      surfaceGoneStreak = 0;
     } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
+      // Surface may have been destroyed (pane closed, Ctrl-D, crash, SIGKILL).
+      // First give any bash EXIT-trap sidecar a chance to land…
       if (options.sessionFile) {
         try {
           const exitFile = `${options.sessionFile}.exit`;
@@ -1507,6 +1532,18 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+      // …otherwise, if the surface stays unreadable for the whole grace window
+      // with no sidecar, treat the subagent as gone so the parent stops waiting
+      // forever. Covers SIGKILL / hard pane destroy, where no trap can run.
+      surfaceGoneStreak++;
+      if (surfaceGoneStreak >= SURFACE_GONE_GRACE_TICKS) {
+        return {
+          reason: "error",
+          exitCode: 137,
+          errorMessage:
+            "Subagent surface disappeared (pane closed or process killed) before it signalled completion.",
+        };
       }
     }
 
