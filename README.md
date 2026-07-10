@@ -1,7 +1,7 @@
 # pi-interactive-subagents
 
 > **Fork note — patch-stack workflow:**
-> This is a patch-stack fork of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), managed by [Saint-work/patch-stack-action](https://github.com/Saint-work/patch-stack-action).
+> This is a patch-stack fork of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), managed by [DJRHails/patch-stack-action](https://github.com/DJRHails/patch-stack-action).
 >
 > **How it works:**
 > - The `base` branch mirrors upstream `main` nightly.
