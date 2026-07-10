@@ -2,7 +2,7 @@
 
 ## Patch-Stack Fork Workflow
 
-This is a **patch-stack fork** of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), managed by [Saint-work/patch-stack-action](https://github.com/Saint-work/patch-stack-action). Our changes live as small, rebasable patches on top of a read-only mirror of upstream — never as ad-hoc commits on `main`.
+This is a **patch-stack fork** of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), managed by [DJRHails/patch-stack-action](https://github.com/DJRHails/patch-stack-action). Our changes live as small, rebasable patches on top of a read-only mirror of upstream — never as ad-hoc commits on `main`.
 
 ### Branch layout
 
