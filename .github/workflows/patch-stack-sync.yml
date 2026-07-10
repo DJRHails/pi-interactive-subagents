@@ -12,7 +12,7 @@ on:
 
 jobs:
   sync:
-    uses: Saint-work/patch-stack-action/.github/workflows/patch-stack-sync.yml@main
+    uses: DJRHails/patch-stack-action/.github/workflows/patch-stack-sync.yml@main
     with:
       upstream_repo: HazAT/pi-interactive-subagents
       upstream_branch: main
