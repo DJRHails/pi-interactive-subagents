@@ -2412,25 +2412,33 @@ describe("headless surfaces", () => {
   }
 
   describe("resolveSurfaceBackend", () => {
-    it("uses the mux backend only with a mux and an interactive terminal", () => {
-      assert.equal(resolveSurfaceBackend("tmux", true, false), "tmux");
-      assert.equal(resolveSurfaceBackend("cmux", true, false), "cmux");
+    it("uses an auto-detected mux backend with an interactive terminal", () => {
+      assert.equal(resolveSurfaceBackend("tmux", true, false, false), "tmux");
+      assert.equal(resolveSurfaceBackend("cmux", true, false, false), "cmux");
     });
 
     it("falls back to headless without a mux backend", () => {
-      assert.equal(resolveSurfaceBackend(null, true, false), "headless");
-      assert.equal(resolveSurfaceBackend(null, false, false), "headless");
+      assert.equal(resolveSurfaceBackend(null, true, false, false), "headless");
+      assert.equal(resolveSurfaceBackend(null, false, false, false), "headless");
+      assert.equal(resolveSurfaceBackend(null, false, false, true), "headless");
     });
 
-    it("falls back to headless when the parent has no interactive terminal", () => {
+    it("falls back to headless when an auto-detected mux meets no interactive terminal", () => {
       // A headless parent (pi -p, RPC driver, CI) can inherit stale mux env
       // vars from the spawning shell — panes must not be attempted there.
-      assert.equal(resolveSurfaceBackend("zellij", false, false), "headless");
-      assert.equal(resolveSurfaceBackend("tmux", false, false), "headless");
+      assert.equal(resolveSurfaceBackend("zellij", false, false, false), "headless");
+      assert.equal(resolveSurfaceBackend("tmux", false, false, false), "headless");
+    });
+
+    it("trusts an explicit mux preference even without an interactive terminal", () => {
+      // PI_SUBAGENT_MUX=<mux> is a deliberate choice (users, test harness);
+      // mux servers accept pane commands from tty-less clients.
+      assert.equal(resolveSurfaceBackend("tmux", false, false, true), "tmux");
+      assert.equal(resolveSurfaceBackend("zellij", false, false, true), "zellij");
     });
 
     it("honors the explicit headless preference over a live mux", () => {
-      assert.equal(resolveSurfaceBackend("tmux", true, true), "headless");
+      assert.equal(resolveSurfaceBackend("tmux", true, true, false), "headless");
     });
   });
 

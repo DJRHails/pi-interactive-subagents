@@ -126,24 +126,34 @@ function hasInteractiveTerminal(): boolean {
 }
 
 /**
- * Decide where subagent surfaces are created. Panes require BOTH a live
- * multiplexer session AND an interactive terminal on the parent process — a
+ * Decide where subagent surfaces are created. An auto-detected multiplexer is
+ * used only when the parent process also has an interactive terminal — a
  * headless parent (`pi -p`, an RPC driver, CI, cron) can inherit stale mux env
  * vars (TMUX/ZELLIJ/...) from the shell that spawned it and would then create
- * panes it cannot host. Everything else falls back to detached background
- * processes. `PI_SUBAGENT_MUX=headless` forces the fallback.
+ * panes it cannot host. An explicit `PI_SUBAGENT_MUX=<mux>` preference is a
+ * deliberate choice (users, test harness) and skips the terminal check, since
+ * mux servers accept pane commands from tty-less clients. Everything else
+ * falls back to detached background processes; `PI_SUBAGENT_MUX=headless`
+ * forces the fallback.
  */
 export function resolveSurfaceBackend(
   muxBackend: MuxBackend | null,
   interactiveTerminal: boolean,
   preferHeadless: boolean,
+  explicitMuxPreference: boolean,
 ): SurfaceBackend {
-  if (preferHeadless || !muxBackend || !interactiveTerminal) return "headless";
+  if (preferHeadless || !muxBackend) return "headless";
+  if (!explicitMuxPreference && !interactiveTerminal) return "headless";
   return muxBackend;
 }
 
 export function getSurfaceBackend(): SurfaceBackend {
-  return resolveSurfaceBackend(getMuxBackend(), hasInteractiveTerminal(), headlessPreferred());
+  return resolveSurfaceBackend(
+    getMuxBackend(),
+    hasInteractiveTerminal(),
+    headlessPreferred(),
+    muxPreference() !== null,
+  );
 }
 
 export function isHeadlessSurface(surface: string): boolean {
