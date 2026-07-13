@@ -2376,3 +2376,66 @@ describe("cmux.ts", () => {
     });
   });
 });
+
+describe("reapReasonFor (auto-reap of dead/orphaned subagents)", () => {
+  const { reapReasonFor, REAP_COMPLETED_GRACE_MS, REAP_STALLED_AFTER_MS } = subagentsModule;
+  type Running = Parameters<typeof reapReasonFor>[0];
+
+  function makeRunning(overrides: Record<string, unknown> = {}): Running {
+    return {
+      id: "x",
+      name: "sub",
+      task: "",
+      surface: "pane:1",
+      startTime: 0,
+      // a path that does not exist, so the `.exit` sidecar check is false
+      sessionFile: join(tmpdir(), `pi-reap-none-${Math.random()}.jsonl`),
+      statusState: { currentKind: "active", lastActivityAtMs: 0 },
+      interactive: false,
+      ...overrides,
+    } as unknown as Running;
+  }
+
+  it("keeps an active subagent", () => {
+    assert.equal(reapReasonFor(makeRunning(), 1000), null);
+  });
+
+  it("reaps a completed (phase=done) entry only after the grace window", () => {
+    const r = makeRunning({ activity: { phase: "done" } });
+    assert.equal(reapReasonFor(r, 0), null); // arms the grace timer
+    assert.equal(reapReasonFor(r, REAP_COMPLETED_GRACE_MS - 1), null);
+    assert.equal(reapReasonFor(r, REAP_COMPLETED_GRACE_MS), "completed");
+  });
+
+  it("reaps a completed entry once its `.exit` sidecar exists", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-reap-exit-"));
+    const sessionFile = join(dir, "s.jsonl");
+    writeFileSync(`${sessionFile}.exit`, '{"type":"exit","exitCode":0}');
+    const r = makeRunning({ sessionFile });
+    assert.equal(reapReasonFor(r, 0), null); // arms grace
+    assert.equal(reapReasonFor(r, REAP_COMPLETED_GRACE_MS), "completed");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reaps a non-interactive entry stalled past the threshold", () => {
+    const r = makeRunning({ statusState: { currentKind: "stalled", lastActivityAtMs: 0 } });
+    assert.equal(reapReasonFor(r, REAP_STALLED_AFTER_MS - 1), null);
+    assert.equal(reapReasonFor(r, REAP_STALLED_AFTER_MS), "stalled");
+  });
+
+  it("never reaps an interactive entry, however long it stalls", () => {
+    const r = makeRunning({
+      interactive: true,
+      statusState: { currentKind: "stalled", lastActivityAtMs: 0 },
+    });
+    assert.equal(reapReasonFor(r, REAP_STALLED_AFTER_MS * 10), null);
+  });
+
+  it("resets the completed grace when the entry resumes activity", () => {
+    const r = makeRunning({ activity: { phase: "done" } });
+    reapReasonFor(r, 0); // arm grace
+    r.activity = { phase: "active" };
+    assert.equal(reapReasonFor(r, REAP_COMPLETED_GRACE_MS + 1), null);
+    assert.equal((r as { reapableSince?: number }).reapableSince, undefined);
+  });
+});

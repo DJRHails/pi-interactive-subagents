@@ -513,10 +513,70 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** When a completed-but-lingering entry first became reapable (orphan grace timer). */
+  reapableSince?: number;
+  /** Set when the reaper aborts a stalled watcher, so its result reads as reaped, not cancelled. */
+  reapReason?: ReapReason;
 }
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+// ── Auto-reap dead / orphaned subagents ──
+//
+// Each entry's own watcher (pollForExit) normally removes it from the tracker
+// when it finishes. Two cases leak an entry forever, leaving a dead "running"
+// row in the widget:
+//   1. Orphaned watcher — a /reload (or an abandoned promise) leaves a map entry
+//      with no live poller, so nothing ever deletes it.
+//   2. SIGKILL + readable-but-dead pane — `kill -9` (or a hard pane destroy)
+//      stops the process without the bash EXIT trap running, yet the mux keeps
+//      the pane readable, so pollForExit's dead-surface detection never trips
+//      and it polls forever.
+// The status loop already visits every entry each second, so it reaps as a
+// backstop: a completed entry lingering past a short grace, or a non-interactive
+// entry stalled past a long threshold, is dead — drop it.
+type ReapReason = "completed" | "stalled";
+
+/** A completed/exited entry lingering longer than this ⇒ its watcher is orphaned ⇒ reap. */
+export const REAP_COMPLETED_GRACE_MS = 10_000;
+/** A non-interactive entry stalled (no activity) longer than this ⇒ dead ⇒ reap. */
+export const REAP_STALLED_AFTER_MS = 300_000;
+
+/** Decide whether a lingering subagent should be reaped this tick (null ⇒ keep). Exported for tests. */
+export function reapReasonFor(running: RunningSubagent, now: number): ReapReason | null {
+  const completed =
+    running.activity?.phase === "done" || existsSync(`${running.sessionFile}.exit`);
+  if (completed) {
+    running.reapableSince ??= now;
+    return now - running.reapableSince >= REAP_COMPLETED_GRACE_MS ? "completed" : null;
+  }
+  running.reapableSince = undefined;
+  const lastActivityAt = running.statusState.lastActivityAtMs ?? running.startTime;
+  const stalledDead =
+    !running.interactive &&
+    running.statusState.currentKind === "stalled" &&
+    now - lastActivityAt >= REAP_STALLED_AFTER_MS;
+  return stalledDead ? "stalled" : null;
+}
+
+/** Remove a dead subagent from the tracker, unsticking its watcher and closing its pane. */
+function reapSubagent(running: RunningSubagent, reason: ReapReason): void {
+  if (reason === "stalled") {
+    // Unstick a watcher still polling a readable-but-dead pane; its detached
+    // .then then delivers a death notice and self-cleans. If the watcher is
+    // already gone (orphaned), abort() is a harmless no-op.
+    running.reapReason = reason;
+    running.abortController?.abort();
+    try {
+      closeSurface(running.surface);
+    } catch {}
+  }
+  // Backstop so the widget clears regardless of whether a live watcher also
+  // deletes (delete() is idempotent). A completed orphan is dropped here; its
+  // pane, if any, is already dead.
+  runningSubagents.delete(running.id);
+}
 
 /**
  * Wrap a subagent launch command so the parent is ALWAYS notified when the
@@ -881,6 +941,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     const transitionLines: string[] = [];
     const now = Date.now();
     let shouldRefreshWidget = false;
+    const toReap: Array<{ running: RunningSubagent; reason: ReapReason }> = [];
 
     for (const running of runningSubagents.values()) {
       observeRunningSubagent(running, now);
@@ -890,6 +951,15 @@ function startStatusRefresh(pi: ExtensionAPI) {
       }
       running.statusState = nextState;
 
+      // Reap dead/orphaned entries the per-entry watcher failed to remove, so a
+      // finished or SIGKILL'd subagent can't sit in the widget as "running".
+      const reason = reapReasonFor(running, now);
+      if (reason) {
+        toReap.push({ running, reason });
+        shouldRefreshWidget = true;
+        continue; // don't emit a status transition for an entry we're dropping
+      }
+
       // Interactive subagents (long-running, user-driven) intentionally don't
       // wake the parent session on stalled/recovered transitions — the user is
       // working in the subagent's pane, and a steer message here would burn an
@@ -898,6 +968,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
         transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
       }
     }
+
+    for (const { running, reason } of toReap) reapSubagent(running, reason);
 
     if (shouldRefreshWidget) updateWidget();
 
@@ -1367,13 +1439,16 @@ async function watchSubagent(
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
+      const reaped = running.reapReason === "stalled";
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: reaped
+          ? "Subagent reaped: unresponsive past the stall threshold (the process appears to have died)."
+          : "Subagent cancelled.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
+        error: reaped ? "reaped" : "cancelled",
         sessionFile,
       };
     }
