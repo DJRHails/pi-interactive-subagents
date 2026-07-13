@@ -42,6 +42,9 @@ Edit an existing patch by checking out its `patch/*` branch (a worktree under `.
 
 - `patch/set-tab-title` — restores the `set_tab_title` tool upstream removed in `251a8d9` (live per-phase tab labels for tracking parallel subagents). PR [#2](https://github.com/DJRHails/pi-interactive-subagents/pull/2).
 - `patch/headless-guard` — skips tool registration when no multiplexer session is live, so a headless-capable subagent extension can own the `subagent` tool name (`pi -p`, gantry, CI). PR [#3](https://github.com/DJRHails/pi-interactive-subagents/pull/3).
+- `patch/headless-guard--headless-fallback` — replaces the headless guard with a working fallback: subagents spawn as detached background processes (`pi -p`, log-backed surface) when no usable multiplexer/interactive terminal is present, with completion detection unchanged. Fixes headless spawning observed on taffy. PR [#6](https://github.com/DJRHails/pi-interactive-subagents/pull/6).
+- `patch/robust-subagent-exit-detection` — always notifies the parent when a child stops (bash EXIT-trap `.exit` sidecar + dead-surface grace window), covering pane close, Ctrl-D, and kill. PR [#4](https://github.com/DJRHails/pi-interactive-subagents/pull/4).
+- `patch/robust-subagent-exit-detection--auto-reap` — auto-reaps dead/orphaned subagents and detaches (rather than kills) live ones on parent reload/switch. PR [#5](https://github.com/DJRHails/pi-interactive-subagents/pull/5).
 
 ### What NOT to do
 
