@@ -356,6 +356,38 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
+/**
+ * Keep a sub-agent on the parent session's provider whenever that provider can
+ * actually serve the requested model — provider-agnostic, no per-family rules.
+ *
+ * pi resolves a bare (or wrong-prefixed) model id against its built-in catalog /
+ * family inference, NOT the caller's current provider. So an orchestrator on
+ * `anthropic-api` that spawns `claude-fable-5` (bare) or `anthropic/claude-fable-5`
+ * lands on the keyless built-in `anthropic` provider and fails; a `codex`
+ * orchestrator that spawns `openai/gpt-5.5` (or bare `gpt-5.6-sol`) would
+ * likewise leave `codex`.
+ *
+ * Rule: strip any provider prefix to the bare id; if the parent's provider
+ * offers that id (`providerHasModel`), route to `parentProvider/<id>`
+ * (fable -> anthropic-api/claude-fable-5, sol -> codex/gpt-5.6-sol,
+ * openai/gpt-5.5 -> codex/gpt-5.5 when on codex). Otherwise leave the caller's
+ * model untouched — the parent's provider can't serve it, so pi's own
+ * resolution is the best available.
+ */
+export function normalizeSubagentModel(
+  model: string | undefined,
+  parentProvider: string | undefined,
+  providerHasModel: (provider: string, modelId: string) => boolean,
+): string | undefined {
+  if (!model || !parentProvider) return model;
+  const slash = model.indexOf("/");
+  const bareId = slash === -1 ? model : model.slice(slash + 1);
+  const explicitProvider = slash === -1 ? undefined : model.slice(0, slash);
+  if (explicitProvider === parentProvider) return model; // already correct
+  if (!providerHasModel(parentProvider, bareId)) return model; // parent can't serve it
+  return `${parentProvider}/${bareId}`;
+}
+
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const configDir = getAgentConfigDir();
   const paths = [
@@ -897,6 +929,7 @@ export const __test__ = {
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
+  normalizeSubagentModel,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
@@ -932,7 +965,12 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: {
+    sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
+    cwd: string;
+    getModel?: () => { provider?: string } | undefined;
+    modelRegistry?: { find: (provider: string, modelId: string) => unknown };
+  },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -940,6 +978,13 @@ async function launchSubagent(
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
+  // Provider the parent session is running on — used to keep sub-agents on the
+  // same provider instead of pi's family-inferred default (see
+  // normalizeSubagentModel). Only the pi child path uses this; the claude CLI
+  // path takes the raw model id.
+  const parentProvider = ctx.getModel?.()?.provider;
+  const providerHasModel = (provider: string, modelId: string): boolean =>
+    !!ctx.modelRegistry?.find(provider, modelId);
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1089,7 +1134,9 @@ async function launchSubagent(
   parts.push("-e", shellEscape(subagentDonePath));
 
   if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
+    const resolvedModel =
+      normalizeSubagentModel(effectiveModel, parentProvider, providerHasModel) ?? effectiveModel;
+    const model = effectiveThinking ? `${resolvedModel}:${effectiveThinking}` : resolvedModel;
     parts.push("--model", shellEscape(model));
   }
 

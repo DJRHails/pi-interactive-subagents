@@ -2376,3 +2376,53 @@ describe("cmux.ts", () => {
     });
   });
 });
+
+describe("normalizeSubagentModel (keep sub-agents on the parent's provider)", () => {
+  const { normalizeSubagentModel } = (subagentsModule as any).__test__;
+
+  // Fake catalog: which (provider, id) pairs exist. Provider-agnostic.
+  const catalog = new Set([
+    "anthropic-api|claude-fable-5",
+    "anthropic-api|claude-opus-4-8[fast]",
+    "codex|gpt-5.6-sol",
+    "codex|gpt-5.5",
+    "openai|gpt-4o",
+  ]);
+  const has = (provider: string, id: string) => catalog.has(`${provider}|${id}`);
+
+  it("routes a bare id to the parent provider that offers it (anthropic-api)", () => {
+    assert.equal(normalizeSubagentModel("claude-fable-5", "anthropic-api", has), "anthropic-api/claude-fable-5");
+    assert.equal(
+      normalizeSubagentModel("claude-opus-4-8[fast]", "anthropic-api", has),
+      "anthropic-api/claude-opus-4-8[fast]",
+    );
+  });
+
+  it("routes a bare id to the parent provider that offers it (codex)", () => {
+    assert.equal(normalizeSubagentModel("gpt-5.6-sol", "codex", has), "codex/gpt-5.6-sol");
+  });
+
+  it("re-points a wrong explicit prefix to the parent provider when it offers the id", () => {
+    // the original anthropic bug
+    assert.equal(normalizeSubagentModel("anthropic/claude-fable-5", "anthropic-api", has), "anthropic-api/claude-fable-5");
+    // fully generic: openai/gpt-5.5 while running on codex -> codex/gpt-5.5
+    assert.equal(normalizeSubagentModel("openai/gpt-5.5", "codex", has), "codex/gpt-5.5");
+  });
+
+  it("leaves the model untouched when the parent provider does NOT offer it", () => {
+    // anthropic-api has no gpt-4o -> respect the caller's openai/ choice
+    assert.equal(normalizeSubagentModel("openai/gpt-4o", "anthropic-api", has), "openai/gpt-4o");
+    // bare gpt-4o while on anthropic-api -> leave for pi's own resolution
+    assert.equal(normalizeSubagentModel("gpt-4o", "anthropic-api", has), "gpt-4o");
+  });
+
+  it("leaves an already-correct explicit provider untouched", () => {
+    assert.equal(normalizeSubagentModel("anthropic-api/claude-fable-5", "anthropic-api", has), "anthropic-api/claude-fable-5");
+    assert.equal(normalizeSubagentModel("codex/gpt-5.5", "codex", has), "codex/gpt-5.5");
+  });
+
+  it("passes through when model or parent provider is missing", () => {
+    assert.equal(normalizeSubagentModel(undefined, "anthropic-api", has), undefined);
+    assert.equal(normalizeSubagentModel("claude-fable-5", undefined, has), "claude-fable-5");
+  });
+});
