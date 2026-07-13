@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,14 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  resolveSurfaceBackend,
+  isHeadlessSurface,
+  createSurface,
+  sendLongCommand,
+  sendEscape,
+  readScreen,
+  closeSurface,
+  pollForExit,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
@@ -2373,6 +2381,160 @@ describe("cmux.ts", () => {
     it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
+    });
+  });
+});
+
+describe("headless surfaces", () => {
+  const POLL_INTERVAL_MS = 50;
+
+  async function withHeadlessBackend(run: (dir: string) => Promise<void>): Promise<void> {
+    const prevMux = process.env.PI_SUBAGENT_MUX;
+    process.env.PI_SUBAGENT_MUX = "headless";
+    const dir = createTestDir();
+    try {
+      await run(dir);
+    } finally {
+      if (prevMux === undefined) delete process.env.PI_SUBAGENT_MUX;
+      else process.env.PI_SUBAGENT_MUX = prevMux;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  async function waitFor(check: () => boolean, timeoutMs = 10000): Promise<void> {
+    const start = Date.now();
+    while (!check()) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`Timed out after ${timeoutMs}ms waiting for condition`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  describe("resolveSurfaceBackend", () => {
+    it("uses the mux backend only with a mux and an interactive terminal", () => {
+      assert.equal(resolveSurfaceBackend("tmux", true, false), "tmux");
+      assert.equal(resolveSurfaceBackend("cmux", true, false), "cmux");
+    });
+
+    it("falls back to headless without a mux backend", () => {
+      assert.equal(resolveSurfaceBackend(null, true, false), "headless");
+      assert.equal(resolveSurfaceBackend(null, false, false), "headless");
+    });
+
+    it("falls back to headless when the parent has no interactive terminal", () => {
+      // A headless parent (pi -p, RPC driver, CI) can inherit stale mux env
+      // vars from the spawning shell — panes must not be attempted there.
+      assert.equal(resolveSurfaceBackend("zellij", false, false), "headless");
+      assert.equal(resolveSurfaceBackend("tmux", false, false), "headless");
+    });
+
+    it("honors the explicit headless preference over a live mux", () => {
+      assert.equal(resolveSurfaceBackend("tmux", true, true), "headless");
+    });
+  });
+
+  it("createSurface creates a headless surface that runs commands detached", async () => {
+    await withHeadlessBackend(async (dir) => {
+      const surface = createSurface("Headless Echo");
+      assert.ok(isHeadlessSurface(surface), `expected headless surface, got ${surface}`);
+
+      const marker = join(dir, "marker.txt");
+      sendLongCommand(
+        surface,
+        `echo HEADLESS_MARKER_OUTPUT; echo done > '${marker}'; echo '__SUBAGENT_DONE_'0'__'`,
+        { scriptPath: join(dir, "launch.sh") },
+      );
+
+      await waitFor(() => existsSync(marker));
+      const screen = readScreen(surface, 50);
+      assert.match(screen, /HEADLESS_MARKER_OUTPUT/);
+      closeSurface(surface);
+    });
+  });
+
+  it("pollForExit sees the completion sentinel of a headless subagent", async () => {
+    await withHeadlessBackend(async (dir) => {
+      const surface = createSurface("Headless Done");
+      sendLongCommand(surface, `echo '__SUBAGENT_DONE_'0'__'`, {
+        scriptPath: join(dir, "launch.sh"),
+      });
+
+      const result = await pollForExit(surface, new AbortController().signal, {
+        interval: POLL_INTERVAL_MS,
+      });
+      assert.equal(result.reason, "sentinel");
+      assert.equal(result.exitCode, 0);
+      closeSurface(surface);
+    });
+  });
+
+  it("pollForExit reports the exit code when the headless child fails at startup", async () => {
+    await withHeadlessBackend(async (dir) => {
+      const surface = createSurface("Headless Crash");
+      // Mirrors the generated launch command: `<child>; echo '__SUBAGENT_DONE_'$?'__'`
+      sendLongCommand(surface, `sh -c 'exit 7'; echo '__SUBAGENT_DONE_'$?'__'`, {
+        scriptPath: join(dir, "launch.sh"),
+      });
+
+      const result = await pollForExit(surface, new AbortController().signal, {
+        interval: POLL_INTERVAL_MS,
+      });
+      assert.equal(result.reason, "sentinel");
+      assert.equal(result.exitCode, 7);
+      closeSurface(surface);
+    });
+  });
+
+  it("pollForExit picks up the .exit sidecar written by a headless subagent", async () => {
+    await withHeadlessBackend(async (dir) => {
+      const sessionFile = join(dir, "child-session.jsonl");
+      const surface = createSurface("Headless Ping");
+      sendLongCommand(
+        surface,
+        `printf '%s' '{"type":"ping","name":"Headless Ping","message":"need help"}' > '${sessionFile}.exit'`,
+        { scriptPath: join(dir, "launch.sh") },
+      );
+
+      const result = await pollForExit(surface, new AbortController().signal, {
+        interval: POLL_INTERVAL_MS,
+        sessionFile,
+      });
+      assert.equal(result.reason, "ping");
+      assert.equal(result.ping?.message, "need help");
+      closeSurface(surface);
+    });
+  });
+
+  it("readScreen reports a killed headless child that left no sentinel", async () => {
+    await withHeadlessBackend(async (dir) => {
+      const surface = createSurface("Headless Killed");
+      const marker = join(dir, "started.txt");
+      // Exits without a sentinel — the headless equivalent of a destroyed pane.
+      sendLongCommand(surface, `echo started > '${marker}'`, {
+        scriptPath: join(dir, "launch.sh"),
+      });
+
+      await waitFor(() => existsSync(marker));
+      await waitFor(() => {
+        try {
+          readScreen(surface, 5);
+          return false;
+        } catch {
+          return true;
+        }
+      });
+      assert.throws(() => readScreen(surface, 5), /gone without a completion sentinel/);
+      closeSurface(surface);
+    });
+  });
+
+  it("sendEscape is rejected for headless surfaces", async () => {
+    await withHeadlessBackend(async (dir) => {
+      void dir;
+      const surface = createSurface("Headless NoEscape");
+      assert.throws(() => sendEscape(surface), /headless subagent/);
+      closeSurface(surface);
     });
   });
 });

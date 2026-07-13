@@ -17,6 +17,8 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
+  getSurfaceBackend,
+  isHeadlessSurface,
   createSurface,
   sendLongCommand,
   pollForExit,
@@ -393,6 +395,9 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+// Only tools that genuinely need a live multiplexer (e.g. tab renames) should
+// return this — spawning tools fall back to detached headless processes when
+// no mux session is available.
 function muxUnavailableResult() {
   return {
     content: [
@@ -622,17 +627,21 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 }
 
 function updateWidget() {
-  if (!latestCtx?.hasUI) return;
-
   if (runningSubagents.size === 0) {
-    latestCtx.ui.setWidget("subagent-status", undefined);
+    // Clear the refresh timer even without a UI — a headless parent would
+    // otherwise keep a live interval (and its process) alive forever.
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
       (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
     }
+    if (latestCtx?.hasUI) {
+      latestCtx.ui.setWidget("subagent-status", undefined);
+    }
     return;
   }
+
+  if (!latestCtx?.hasUI) return;
 
   latestCtx.ui.setWidget(
     "subagent-status",
@@ -967,10 +976,12 @@ async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
+  // For new panes, pause briefly so the shell is ready before sending the
+  // command. Headless surfaces spawn the process directly — no shell to warm.
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
+  const headlessSurface = isHeadlessSurface(surface);
+  if (!surfacePreCreated && !headlessSurface) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
@@ -1015,6 +1026,11 @@ async function launchSubagent(
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
     cmdParts.push("claude");
     cmdParts.push("--dangerously-skip-permissions");
+
+    // No terminal to render the interactive UI into — use print mode.
+    if (headlessSurface) {
+      cmdParts.push("-p");
+    }
 
     if (existsSync(pluginDir)) {
       cmdParts.push("--plugin-dir", shellEscape(pluginDir));
@@ -1087,6 +1103,12 @@ async function launchSubagent(
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
+
+  // Headless surfaces have no terminal for pi's interactive UI — run the
+  // child in print mode so it processes the task and exits on its own.
+  if (headlessSurface) {
+    parts.push("-p");
+  }
 
   if (effectiveModel) {
     const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
@@ -1358,20 +1380,17 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-  // Headless guard: every tool here spawns/manages multiplexer panes, so
-  // without a live mux (inside cmux/tmux/zellij/WezTerm — binaries alone don't
-  // count, see cmux.ts runtime checks) they can only ever answer "mux not
-  // available". Worse, registering anyway squats the `subagent` tool name: pi
-  // fails the LATER extension on a name collision, so a headless-capable
-  // subagent extension (e.g. npm pi-subagents) never loads in headless
-  // contexts (pi -p, gantry workers, CI). Detected once at load — a mux can't
-  // appear mid-session for an already-started pi process.
-  if (!isMuxAvailable()) {
+  // Without a usable multiplexer session (inside cmux/tmux/zellij/WezTerm —
+  // binaries alone don't count, see cmux.ts runtime checks) or without an
+  // interactive terminal on this process, subagents fall back to detached
+  // background processes instead of panes. Headless contexts (pi -p, RPC
+  // drivers, gantry workers, CI) therefore get working subagents from this
+  // extension rather than "mux not available" errors.
+  if (getSurfaceBackend() === "headless") {
     console.error(
-      "[interactive-subagents] no terminal multiplexer session detected — " +
-        "skipping tool registration so a headless subagent extension can own the name",
+      "[interactive-subagents] no usable multiplexer session — " +
+        "subagents will run as detached background processes",
     );
-    return;
   }
 
   // Capture the UI context for widget updates
@@ -1415,14 +1434,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent in a dedicated terminal multiplexer pane (or as a detached background process when no multiplexer is available). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent in a dedicated terminal multiplexer pane (or as a detached background process when no multiplexer is available). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1446,10 +1465,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Validate prerequisites
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult();
-        }
-
         if (!ctx.sessionManager.getSessionFile()) {
           return {
             content: [
@@ -1727,14 +1742,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
+        "Resume a previous sub-agent session in a new multiplexer pane (or as a detached background process when no multiplexer is available). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
+        "Resume a previous sub-agent session in a new multiplexer pane (or as a detached background process when no multiplexer is available). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1793,10 +1808,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult();
-        }
-
         if (!existsSync(params.sessionPath)) {
           return {
             content: [
@@ -1810,7 +1821,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        const headlessSurface = isHeadlessSurface(surface);
+        if (!headlessSurface) {
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        }
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
@@ -1818,6 +1832,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
+
+        // Headless surfaces have no terminal for pi's interactive UI — run the
+        // resumed session in print mode so it processes the message and exits.
+        if (headlessSurface) {
+          parts.push("-p");
+        }
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
