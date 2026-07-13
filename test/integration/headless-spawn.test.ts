@@ -184,7 +184,11 @@ describe("headless-spawn", { timeout: 120_000 }, () => {
     );
 
     const result = await waitForResult(sentMessages);
-    assert.match(result.content, /failed \(exit code 1\)/);
+    // The exact wording depends on which exit signal lands first: the log
+    // sentinel reads "failed (exit code 1)", while the .exit trap sidecar
+    // (robust exit detection) reads "failed after Ns (provider/agent error…)".
+    // Either way the parent must be told about the failure instead of hanging.
+    assert.match(result.content, /failed/);
     assert.equal(result.details.exitCode, 1);
   });
 });
