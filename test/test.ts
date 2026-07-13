@@ -2439,3 +2439,84 @@ describe("reapReasonFor (auto-reap of dead/orphaned subagents)", () => {
     assert.equal((r as { reapableSince?: number }).reapableSince, undefined);
   });
 });
+
+describe("watchSubagent lifecycle detach", () => {
+  const testApi = (subagentsModule as any).__test__;
+  const runningMap = testApi.runningSubagents as Map<string, any>;
+
+  function makeWatched(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "w1",
+      name: "Worker",
+      task: "do it",
+      surface: "surface:42",
+      startTime: 0,
+      sessionFile: "worker.jsonl",
+      interactive: true,
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      ...overrides,
+    };
+  }
+
+  async function runWatch(running: any, controller: AbortController, pollError: string) {
+    let closed: string | null = null;
+    const result = await testApi.watchSubagent(running, controller.signal, {
+      async pollForExit() {
+        throw new Error(pollError);
+      },
+      closeSurface(surface: string) {
+        closed = surface;
+      },
+    });
+    return { result, closed };
+  }
+
+  it("detaches without closing the surface when the watcher is aborted (reload / session switch)", async () => {
+    runningMap.clear();
+    const running = makeWatched();
+    runningMap.set(running.id, running);
+    const controller = new AbortController();
+    controller.abort(); // simulate session_shutdown / reload abort
+
+    const { result, closed } = await runWatch(running, controller, "Aborted while waiting for subagent to finish");
+
+    assert.equal(result.detached, true);
+    assert.equal(result.exitCode, 0);
+    assert.equal(closed, null, "must NOT close the pane on a lifecycle abort");
+    assert.equal(runningMap.has("w1"), false, "stops tracking the detached agent");
+    runningMap.clear();
+  });
+
+  it("still closes the surface for a reaper-aborted stalled entry (genuinely dead)", async () => {
+    runningMap.clear();
+    // reapReason set by the reaper before it abort()s the stalled watcher
+    const running = makeWatched({ id: "w2", surface: "surface:77", reapReason: "stalled" });
+    runningMap.set(running.id, running);
+    const controller = new AbortController();
+    controller.abort();
+
+    const { result, closed } = await runWatch(running, controller, "Aborted");
+
+    assert.equal(result.detached ?? false, false, "a reaped entry is not a detach");
+    assert.equal(result.error, "reaped");
+    assert.equal(closed, "surface:77", "reaped-dead panes are still closed");
+    assert.equal(runningMap.has("w2"), false);
+    runningMap.clear();
+  });
+
+  it("closes the orphaned surface on a genuine (non-abort) watcher failure", async () => {
+    runningMap.clear();
+    const running = makeWatched({ id: "w3", surface: "surface:99" });
+    runningMap.set(running.id, running);
+    const controller = new AbortController(); // NOT aborted
+
+    const { result, closed } = await runWatch(running, controller, "cmux read-screen failed");
+
+    assert.equal(result.detached ?? false, false);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.error, /cmux read-screen failed/);
+    assert.equal(closed, "surface:99", "closes the orphaned pane so it does not leak");
+    assert.equal(runningMap.has("w3"), false);
+    runningMap.clear();
+  });
+});
