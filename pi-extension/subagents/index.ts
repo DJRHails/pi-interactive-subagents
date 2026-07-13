@@ -486,6 +486,12 @@ interface SubagentResult {
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   ping?: { name: string; message: string };
+  /**
+   * True when the watcher stopped because the parent session was reloaded or
+   * switched (a lifecycle detach), not because the sub-agent finished. The
+   * child pane is deliberately left running; callers must NOT steer a result.
+   */
+  detached?: boolean;
 }
 
 /**
@@ -1025,6 +1031,7 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
+  watchSubagent,
 };
 
 function startWidgetRefresh() {
@@ -1368,14 +1375,27 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+/** Injectable multiplexer deps so watchSubagent's detach/close logic is testable. */
+interface WatchSubagentDeps {
+  pollForExit: typeof pollForExit;
+  closeSurface: typeof closeSurface;
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  deps: WatchSubagentDeps = { pollForExit, closeSurface },
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  const { pollForExit: poll, closeSurface: close } = deps;
+
+  // Capture the module-level poll-abort signal at watcher-creation time. On
+  // /reload the global is REPLACED with a fresh controller, so re-reading it in
+  // the catch would miss the abort — we must hold the original reference here.
+  const moduleSignal = getModuleAbortSignal();
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await poll(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1416,7 +1436,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      close(surface);
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1441,7 +1461,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closeSurface(surface);
+    close(surface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1455,13 +1475,36 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const reaped = running.reapReason === "stalled";
+
+    // A reaper-aborted stalled entry is genuinely dead — the reaper already
+    // closed its pane — so fall through to close + report "reaped". Otherwise a
+    // bare abort means a LIFECYCLE DETACH: /reload re-imports this module
+    // (moduleSignal) or session_shutdown aborts the watcher (signal), and the
+    // sub-agent is still live in its own pane (the user may be actively driving
+    // an interactive one). NEVER close the surface on a detach — doing so
+    // previously nuked every running agent whenever the parent reloaded or
+    // switched sessions. Just stop watching; leave the pane running.
+    if (!reaped && (signal.aborted || moduleSignal.aborted)) {
+      runningSubagents.delete(running.id);
+      return {
+        name,
+        task,
+        summary: "Subagent detached (parent session reloaded or switched); pane left running.",
+        exitCode: 0,
+        elapsed,
+        detached: true,
+        sessionFile,
+      };
+    }
+
     try {
-      closeSurface(surface);
+      close(surface);
     } catch {}
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
-      const reaped = running.reapReason === "stalled";
       return {
         name,
         task,
@@ -1469,7 +1512,7 @@ async function watchSubagent(
           ? "Subagent reaped: unresponsive past the stall threshold (the process appears to have died)."
           : "Subagent cancelled.",
         exitCode: 1,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        elapsed,
         error: reaped ? "reaped" : "cancelled",
         sessionFile,
       };
@@ -1479,7 +1522,7 @@ async function watchSubagent(
       task,
       summary: `Subagent error: ${err?.message ?? String(err)}`,
       exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
+      elapsed,
       error: err?.message ?? String(err),
     };
   }
@@ -1505,6 +1548,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // Clean up on session shutdown
+  // Detach from running sub-agents on session shutdown (quit / reload / new /
+  // resume / fork). Aborting each watcher stops the poll loops; watchSubagent's
+  // catch treats the abort as a detach and LEAVES each pane running rather than
+  // closing it, so switching or reloading the parent never kills the user's
+  // live (especially interactive) sub-agents.
   pi.on("session_shutdown", (_event, _ctx) => {
     if (widgetInterval) {
       clearInterval(widgetInterval);
@@ -1599,6 +1647,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+
+            // Parent reloaded / switched session: child pane left running, do
+            // not steer a result or trigger a turn.
+            if (result.detached) return;
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
@@ -2031,6 +2083,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+
+            // Parent reloaded / switched session: child pane left running, do
+            // not steer a result or trigger a turn.
+            if (result.detached) return;
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
