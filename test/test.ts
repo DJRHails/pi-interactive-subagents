@@ -2544,6 +2544,9 @@ describe("headless surfaces", () => {
       assert.throws(() => sendEscape(surface), /headless subagent/);
       closeSurface(surface);
     });
+  });
+});
+
 describe("reapReasonFor (auto-reap of dead/orphaned subagents)", () => {
   const { reapReasonFor, REAP_COMPLETED_GRACE_MS, REAP_STALLED_AFTER_MS } = subagentsModule;
   type Running = Parameters<typeof reapReasonFor>[0];
