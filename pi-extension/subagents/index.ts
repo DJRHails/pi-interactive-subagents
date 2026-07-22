@@ -388,6 +388,23 @@ export function normalizeSubagentModel(
   return `${parentProvider}/${bareId}`;
 }
 
+/**
+ * The provider the parent session runs on, read from pi's ExtensionContext.
+ *
+ * pi exposes the current model as a `model` PROPERTY (`Model | undefined`), NOT a
+ * `getModel()` method. Reading it as a call silently yields `undefined`, which
+ * disables normalizeSubagentModel (it early-returns with no parentProvider) so an
+ * ambiguous bare id like `claude-fable-5` — present in BOTH the keyless built-in
+ * `anthropic` provider and the custom `anthropic-api` one — falls through to the
+ * keyless built-in and the sub-agent exits 1 ("No API key found for anthropic").
+ * `claude-opus-4-8[fast]` escaped this only because its id is unique to
+ * `anthropic-api`. Centralised + unit-tested so the getModel()-vs-.model slip
+ * cannot recur silently.
+ */
+export function parentProviderFromCtx(ctx: { model?: { provider?: string } }): string | undefined {
+  return ctx.model?.provider;
+}
+
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const configDir = getAgentConfigDir();
   const paths = [
@@ -930,6 +947,7 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   normalizeSubagentModel,
+  parentProviderFromCtx,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
@@ -968,7 +986,10 @@ async function launchSubagent(
   ctx: {
     sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
     cwd: string;
-    getModel?: () => { provider?: string } | undefined;
+    // pi's ExtensionContext exposes the current model as a `model` PROPERTY
+    // (Model<any> | undefined), not a getModel() method — reading it as a call
+    // silently yields undefined, disabling normalizeSubagentModel (see below).
+    model?: { provider?: string };
     modelRegistry?: { find: (provider: string, modelId: string) => unknown };
   },
   options?: { surface?: string },
@@ -982,7 +1003,7 @@ async function launchSubagent(
   // same provider instead of pi's family-inferred default (see
   // normalizeSubagentModel). Only the pi child path uses this; the claude CLI
   // path takes the raw model id.
-  const parentProvider = ctx.getModel?.()?.provider;
+  const parentProvider = parentProviderFromCtx(ctx);
   const providerHasModel = (provider: string, modelId: string): boolean =>
     !!ctx.modelRegistry?.find(provider, modelId);
   const effectiveTools = params.tools ?? agentDefs?.tools;

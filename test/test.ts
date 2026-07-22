@@ -2377,6 +2377,29 @@ describe("cmux.ts", () => {
   });
 });
 
+describe("parentProviderFromCtx (reads ctx.model.provider, not getModel())", () => {
+  const { parentProviderFromCtx } = (subagentsModule as any).__test__;
+
+  it("reads the provider from the model property", () => {
+    assert.equal(parentProviderFromCtx({ model: { provider: "anthropic-api" } }), "anthropic-api");
+  });
+
+  it("returns undefined when no model is present", () => {
+    assert.equal(parentProviderFromCtx({}), undefined);
+  });
+
+  it("does NOT read a getModel() method (the fable-on-taffy regression)", () => {
+    // pi's ExtensionContext has no getModel(); a ctx that only offers one must
+    // yield undefined. If this ever returns "anthropic-api", someone reverted to
+    // ctx.getModel?.() and every ambiguous model id will leak to the keyless
+    // built-in `anthropic` provider again.
+    assert.equal(
+      parentProviderFromCtx({ getModel: () => ({ provider: "anthropic-api" }) } as any),
+      undefined,
+    );
+  });
+});
+
 describe("normalizeSubagentModel (keep sub-agents on the parent's provider)", () => {
   const { normalizeSubagentModel } = (subagentsModule as any).__test__;
 
