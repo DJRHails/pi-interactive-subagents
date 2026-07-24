@@ -17,6 +17,8 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
+  getSurfaceBackend,
+  isHeadlessSurface,
   createSurface,
   sendLongCommand,
   pollForExit,
@@ -475,6 +477,9 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+// Only tools that genuinely need a live multiplexer (e.g. tab renames) should
+// return this — spawning tools fall back to detached headless processes when
+// no mux session is available.
 function muxUnavailableResult() {
   return {
     content: [
@@ -563,6 +568,12 @@ interface SubagentResult {
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   ping?: { name: string; message: string };
+  /**
+   * True when the watcher stopped because the parent session was reloaded or
+   * switched (a lifecycle detach), not because the sub-agent finished. The
+   * child pane is deliberately left running; callers must NOT steer a result.
+   */
+  detached?: boolean;
 }
 
 /**
@@ -595,10 +606,101 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** When a completed-but-lingering entry first became reapable (orphan grace timer). */
+  reapableSince?: number;
+  /** Set when the reaper aborts a stalled watcher, so its result reads as reaped, not cancelled. */
+  reapReason?: ReapReason;
 }
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+// ── Auto-reap dead / orphaned subagents ──
+//
+// Each entry's own watcher (pollForExit) normally removes it from the tracker
+// when it finishes. Two cases leak an entry forever, leaving a dead "running"
+// row in the widget:
+//   1. Orphaned watcher — a /reload (or an abandoned promise) leaves a map entry
+//      with no live poller, so nothing ever deletes it.
+//   2. SIGKILL + readable-but-dead pane — `kill -9` (or a hard pane destroy)
+//      stops the process without the bash EXIT trap running, yet the mux keeps
+//      the pane readable, so pollForExit's dead-surface detection never trips
+//      and it polls forever.
+// The status loop already visits every entry each second, so it reaps as a
+// backstop: a completed entry lingering past a short grace, or a non-interactive
+// entry stalled past a long threshold, is dead — drop it.
+type ReapReason = "completed" | "stalled";
+
+/** A completed/exited entry lingering longer than this ⇒ its watcher is orphaned ⇒ reap. */
+export const REAP_COMPLETED_GRACE_MS = 10_000;
+/** A non-interactive entry stalled (no activity) longer than this ⇒ dead ⇒ reap. */
+export const REAP_STALLED_AFTER_MS = 300_000;
+
+/** Decide whether a lingering subagent should be reaped this tick (null ⇒ keep). Exported for tests. */
+export function reapReasonFor(running: RunningSubagent, now: number): ReapReason | null {
+  const completed =
+    running.activity?.phase === "done" || existsSync(`${running.sessionFile}.exit`);
+  if (completed) {
+    running.reapableSince ??= now;
+    return now - running.reapableSince >= REAP_COMPLETED_GRACE_MS ? "completed" : null;
+  }
+  running.reapableSince = undefined;
+  const lastActivityAt = running.statusState.lastActivityAtMs ?? running.startTime;
+  const stalledDead =
+    !running.interactive &&
+    running.statusState.currentKind === "stalled" &&
+    now - lastActivityAt >= REAP_STALLED_AFTER_MS;
+  return stalledDead ? "stalled" : null;
+}
+
+/** Remove a dead subagent from the tracker, unsticking its watcher and closing its pane. */
+function reapSubagent(running: RunningSubagent, reason: ReapReason): void {
+  if (reason === "stalled") {
+    // Unstick a watcher still polling a readable-but-dead pane; its detached
+    // .then then delivers a death notice and self-cleans. If the watcher is
+    // already gone (orphaned), abort() is a harmless no-op.
+    running.reapReason = reason;
+    running.abortController?.abort();
+    try {
+      closeSurface(running.surface);
+    } catch {}
+  }
+  // Backstop so the widget clears regardless of whether a live watcher also
+  // deletes (delete() is idempotent). A completed orphan is dropped here; its
+  // pane, if any, is already dead.
+  runningSubagents.delete(running.id);
+}
+
+/**
+ * Wrap a subagent launch command so the parent is ALWAYS notified when the
+ * child stops — even if the user Ctrl-D's or closes the pane, or the process
+ * crashes. A bash trap writes a fallback `.exit` sidecar (unless the child
+ * already wrote one via subagent_done) and prints the sentinel marker. Signals
+ * are converted into a normal exit so the EXIT trap runs exactly once.
+ *
+ * This covers everything except SIGKILL, which cannot be trapped; the
+ * parent-side dead-surface detection in pollForExit handles that case.
+ */
+function withExitSignal(innerCommand: string, exitFile: string): string {
+  const ef = shellEscape(exitFile);
+  return [
+    "__pi_sa_signal() {",
+    "  __rc=$?;",
+    "  if [ ! -e " + ef + " ]; then",
+    "    if [ \"$__rc\" -eq 0 ]; then",
+    "      printf '{\"type\":\"exit\",\"exitCode\":0}' > " + ef + " 2>/dev/null;",
+    "    else",
+    "      printf '{\"type\":\"exit\",\"exitCode\":%s,\"errorMessage\":\"Subagent process exited with code %s without signalling completion (pane closed or process killed).\"}' \"$__rc\" \"$__rc\" > " + ef + " 2>/dev/null;",
+    "    fi;",
+    "  fi;",
+    "  echo \"__SUBAGENT_DONE_${__rc}__\";",
+    "}",
+    "trap __pi_sa_signal EXIT;",
+    "trap 'exit 143' HUP TERM;",
+    "trap 'exit 130' INT;",
+    innerCommand,
+  ].join("\n");
+}
 
 // ── Widget management ──
 
@@ -704,17 +806,21 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 }
 
 function updateWidget() {
-  if (!latestCtx?.hasUI) return;
-
   if (runningSubagents.size === 0) {
-    latestCtx.ui.setWidget("subagent-status", undefined);
+    // Clear the refresh timer even without a UI — a headless parent would
+    // otherwise keep a live interval (and its process) alive forever.
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
       (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
     }
+    if (latestCtx?.hasUI) {
+      latestCtx.ui.setWidget("subagent-status", undefined);
+    }
     return;
   }
+
+  if (!latestCtx?.hasUI) return;
 
   latestCtx.ui.setWidget(
     "subagent-status",
@@ -932,6 +1038,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     const transitionLines: string[] = [];
     const now = Date.now();
     let shouldRefreshWidget = false;
+    const toReap: Array<{ running: RunningSubagent; reason: ReapReason }> = [];
 
     for (const running of runningSubagents.values()) {
       observeRunningSubagent(running, now);
@@ -941,6 +1048,15 @@ function startStatusRefresh(pi: ExtensionAPI) {
       }
       running.statusState = nextState;
 
+      // Reap dead/orphaned entries the per-entry watcher failed to remove, so a
+      // finished or SIGKILL'd subagent can't sit in the widget as "running".
+      const reason = reapReasonFor(running, now);
+      if (reason) {
+        toReap.push({ running, reason });
+        shouldRefreshWidget = true;
+        continue; // don't emit a status transition for an entry we're dropping
+      }
+
       // Interactive subagents (long-running, user-driven) intentionally don't
       // wake the parent session on stalled/recovered transitions — the user is
       // working in the subagent's pane, and a steer message here would burn an
@@ -949,6 +1065,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
         transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
       }
     }
+
+    for (const { running, reason } of toReap) reapSubagent(running, reason);
 
     if (shouldRefreshWidget) updateWidget();
 
@@ -998,6 +1116,7 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
+  watchSubagent,
 };
 
 function startWidgetRefresh() {
@@ -1067,10 +1186,12 @@ async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
+  // For new panes, pause briefly so the shell is ready before sending the
+  // command. Headless surfaces spawn the process directly — no shell to warm.
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
+  const headlessSurface = isHeadlessSurface(surface);
+  if (!surfacePreCreated && !headlessSurface) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
@@ -1122,6 +1243,11 @@ async function launchSubagent(
     cmdParts.push("claude");
     cmdParts.push("--dangerously-skip-permissions");
 
+    // No terminal to render the interactive UI into — use print mode.
+    if (headlessSurface) {
+      cmdParts.push("-p");
+    }
+
     if (existsSync(pluginDir)) {
       cmdParts.push("--plugin-dir", shellEscape(pluginDir));
     }
@@ -1144,7 +1270,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = withExitSignal(`${cdPrefix}${cmdParts.join(" ")}`, `${subagentSessionFile}.exit`);
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1193,6 +1319,12 @@ async function launchSubagent(
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
+
+  // Headless surfaces have no terminal for pi's interactive UI — run the
+  // child in print mode so it processes the task and exits on its own.
+  if (headlessSurface) {
+    parts.push("-p");
+  }
 
   if (effectiveModel) {
     const resolvedModel =
@@ -1286,7 +1418,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = withExitSignal(piCommand, `${subagentSessionFile}.exit`);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1351,14 +1483,27 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+/** Injectable multiplexer deps so watchSubagent's detach/close logic is testable. */
+interface WatchSubagentDeps {
+  pollForExit: typeof pollForExit;
+  closeSurface: typeof closeSurface;
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  deps: WatchSubagentDeps = { pollForExit, closeSurface },
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  const { pollForExit: poll, closeSurface: close } = deps;
+
+  // Capture the module-level poll-abort signal at watcher-creation time. On
+  // /reload the global is REPLACED with a fresh controller, so re-reading it in
+  // the catch would miss the abort — we must hold the original reference here.
+  const moduleSignal = getModuleAbortSignal();
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await poll(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1399,7 +1544,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      close(surface);
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1424,7 +1569,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closeSurface(surface);
+    close(surface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1438,8 +1583,32 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const reaped = running.reapReason === "stalled";
+
+    // A reaper-aborted stalled entry is genuinely dead — the reaper already
+    // closed its pane — so fall through to close + report "reaped". Otherwise a
+    // bare abort means a LIFECYCLE DETACH: /reload re-imports this module
+    // (moduleSignal) or session_shutdown aborts the watcher (signal), and the
+    // sub-agent is still live in its own pane (the user may be actively driving
+    // an interactive one). NEVER close the surface on a detach — doing so
+    // previously nuked every running agent whenever the parent reloaded or
+    // switched sessions. Just stop watching; leave the pane running.
+    if (!reaped && (signal.aborted || moduleSignal.aborted)) {
+      runningSubagents.delete(running.id);
+      return {
+        name,
+        task,
+        summary: "Subagent detached (parent session reloaded or switched); pane left running.",
+        exitCode: 0,
+        elapsed,
+        detached: true,
+        sessionFile,
+      };
+    }
+
     try {
-      closeSurface(surface);
+      close(surface);
     } catch {}
     runningSubagents.delete(running.id);
 
@@ -1447,10 +1616,12 @@ async function watchSubagent(
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: reaped
+          ? "Subagent reaped: unresponsive past the stall threshold (the process appears to have died)."
+          : "Subagent cancelled.",
         exitCode: 1,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
+        elapsed,
+        error: reaped ? "reaped" : "cancelled",
         sessionFile,
       };
     }
@@ -1459,19 +1630,37 @@ async function watchSubagent(
       task,
       summary: `Subagent error: ${err?.message ?? String(err)}`,
       exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
+      elapsed,
       error: err?.message ?? String(err),
     };
   }
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  // Without a usable multiplexer session (inside cmux/tmux/zellij/WezTerm —
+  // binaries alone don't count, see cmux.ts runtime checks) or without an
+  // interactive terminal on this process, subagents fall back to detached
+  // background processes instead of panes. Headless contexts (pi -p, RPC
+  // drivers, gantry workers, CI) therefore get working subagents from this
+  // extension rather than "mux not available" errors.
+  if (getSurfaceBackend() === "headless") {
+    console.error(
+      "[interactive-subagents] no usable multiplexer session — " +
+        "subagents will run as detached background processes",
+    );
+  }
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
   });
 
   // Clean up on session shutdown
+  // Detach from running sub-agents on session shutdown (quit / reload / new /
+  // resume / fork). Aborting each watcher stops the poll loops; watchSubagent's
+  // catch treats the abort as a detach and LEAVES each pane running rather than
+  // closing it, so switching or reloading the parent never kills the user's
+  // live (especially interactive) sub-agents.
   pi.on("session_shutdown", (_event, _ctx) => {
     if (widgetInterval) {
       clearInterval(widgetInterval);
@@ -1507,14 +1696,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent in a dedicated terminal multiplexer pane (or as a detached background process when no multiplexer is available). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent in a dedicated terminal multiplexer pane (or as a detached background process when no multiplexer is available). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1538,10 +1727,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Validate prerequisites
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult();
-        }
-
         if (!ctx.sessionManager.getSessionFile()) {
           return {
             content: [
@@ -1570,6 +1755,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+
+            // Parent reloaded / switched session: child pane left running, do
+            // not steer a result or trigger a turn.
+            if (result.detached) return;
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
@@ -1854,14 +2043,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
+        "Resume a previous sub-agent session in a new multiplexer pane (or as a detached background process when no multiplexer is available). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
+        "Resume a previous sub-agent session in a new multiplexer pane (or as a detached background process when no multiplexer is available). " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1920,10 +2109,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult();
-        }
-
         if (!existsSync(params.sessionPath)) {
           return {
             content: [
@@ -1937,7 +2122,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        const headlessSurface = isHeadlessSurface(surface);
+        if (!headlessSurface) {
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        }
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
@@ -1945,6 +2133,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
+
+        // Headless surfaces have no terminal for pi's interactive UI — run the
+        // resumed session in print mode so it processes the message and exits.
+        if (headlessSurface) {
+          parts.push("-p");
+        }
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -1983,7 +2177,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = withExitSignal(`${resumeEnvPrefix}${parts.join(" ")}`, `${params.sessionPath}.exit`);
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2032,6 +2226,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+
+            // Parent reloaded / switched session: child pane left running, do
+            // not steer a result or trigger a turn.
+            if (result.detached) return;
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
