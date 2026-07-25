@@ -26,6 +26,7 @@ import {
   parseCmuxJson,
   parseCmuxPaneRefForSurface,
   parseCmuxPaneRefForSurfaceFromJson,
+  resolveCallerSurface,
   canSplitZellijPane,
   predictZellijSplitDirection,
   selectZellijPlacement,
@@ -2086,6 +2087,44 @@ describe("subagents widget rendering", () => {
 });
 
 describe("cmux.ts", () => {
+  describe("resolveCallerSurface", () => {
+    const live = new Set(["3879B600-8F94-4986-9EF3-D9A0FA98E4DE", "surface:1"]);
+    const exists = (ref: string) => live.has(ref);
+
+    it("targets the caller surface while cmux still knows it", () => {
+      assert.equal(resolveCallerSurface("surface:1", exists), "surface:1");
+    });
+
+    it("drops a stale surface id so the split falls back to the focused surface", () => {
+      // CMUX_SURFACE_ID is captured at process start; cmux recreates surfaces
+      // under a long-lived pi (session restore, tab rename). Passing the dead id
+      // to `cmux new-split --surface` fails with `not_found: Surface not found`,
+      // which killed every spawn from that session.
+      assert.equal(resolveCallerSurface("B173D96B-9FC3-4495-9D45-231E54BB2B62", exists), undefined);
+    });
+
+    it("returns undefined when the env var is unset or empty", () => {
+      assert.equal(resolveCallerSurface(undefined, exists), undefined);
+      assert.equal(resolveCallerSurface("", exists), undefined);
+    });
+
+    it("treats a failed tree lookup as 'not live' rather than throwing", () => {
+      const throwing = () => {
+        throw new Error("cmux socket unavailable");
+      };
+      assert.equal(
+        resolveCallerSurface("surface:1", (ref) => {
+          try {
+            return throwing();
+          } catch {
+            return false;
+          }
+        }),
+        undefined,
+      );
+    });
+  });
+
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");

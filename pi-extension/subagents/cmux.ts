@@ -710,6 +710,61 @@ function renameCmuxSurface(surface: string, name: string): void {
   execFileSync("cmux", ["rename-tab", "--surface", surface, name], { encoding: "utf8" });
 }
 
+/** True when cmux's live tree still contains this surface/pane ref. */
+function cmuxRefExists(ref: string): boolean {
+  try {
+    return execSync(`cmux tree`, { encoding: "utf8" }).includes(ref);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pick the surface a new split should be cut from, discarding a stale id.
+ *
+ * `CMUX_SURFACE_ID` is captured once, when the pi process starts, but cmux can
+ * recreate a surface under the still-running process (session restore, a
+ * workspace/tab rename, closing and re-opening the tab). The env var then names
+ * a surface that no longer exists and `cmux new-split --surface <dead id>`
+ * fails with `not_found: Surface not found` — which killed *every* subagent
+ * spawn from that session, before the child process was ever started. Splitting
+ * from whatever is focused is a far better outcome than not spawning at all.
+ *
+ * Pure so it can be tested without a live cmux; `createSurface` injects the
+ * real tree lookup.
+ */
+export function resolveCallerSurface(
+  envSurfaceId: string | undefined,
+  surfaceExists: (ref: string) => boolean,
+): string | undefined {
+  if (!envSurfaceId) return undefined;
+  return surfaceExists(envSurfaceId) ? envSurfaceId : undefined;
+}
+
+function liveCallerSurface(): string | undefined {
+  return resolveCallerSurface(process.env.CMUX_SURFACE_ID, cmuxRefExists);
+}
+
+function runCmuxNewSplit(
+  direction: "left" | "right" | "up" | "down",
+  fromSurface?: string,
+): string {
+  if (fromSurface) {
+    try {
+      return execFileSync("cmux", ["new-split", direction, "--surface", fromSurface], {
+        encoding: "utf8",
+      }).trim();
+    } catch (error) {
+      console.error(
+        `[interactive-subagents] cmux new-split from surface ${fromSurface} failed ` +
+          `(${error instanceof Error ? error.message : String(error)}); ` +
+          `retrying from the focused surface`,
+      );
+    }
+  }
+  return execFileSync("cmux", ["new-split", direction], { encoding: "utf8" }).trim();
+}
+
 function createCmuxSplitSurface(
   name: string,
   direction: "left" | "right" | "up" | "down",
@@ -721,10 +776,11 @@ function createCmuxSplitSurface(
   let child: CmuxCreatedSurface | null = null;
 
   try {
-    const args = ["new-split", direction];
-    if (fromSurface) args.push("--surface", fromSurface);
-
-    const output = execFileSync("cmux", args, { encoding: "utf8" }).trim();
+    // `fromSurface` is checked against the live tree before we get here, but the
+    // surface can still die in between (a rename or restore lands mid-spawn), so
+    // a failed targeted split retries from the focused surface rather than
+    // taking the whole spawn down with it.
+    const output = runCmuxNewSplit(direction, fromSurface);
     child = parseCmuxCreatedSurface(output, "new-split");
     child.paneRef ??= readCmuxPaneRefForSurface(child.surface) ?? undefined;
     renameCmuxSurface(child.surface, name);
@@ -767,7 +823,7 @@ export function createSurface(name: string): string {
   }
 
   if (backend === "cmux") {
-    const created = createCmuxSplitSurface(name, "right", process.env.CMUX_SURFACE_ID);
+    const created = createCmuxSplitSurface(name, "right", liveCallerSurface());
     cmuxSubagentPane = created.paneRef ?? null;
     return created.surface;
   }
@@ -911,11 +967,12 @@ export function renameCurrentTab(title: string): void {
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
-    const surfaceId = process.env.CMUX_SURFACE_ID;
-    if (!surfaceId) throw new Error("CMUX_SURFACE_ID not set");
-    execSync(`cmux rename-tab --surface ${shellEscape(surfaceId)} ${shellEscape(title)}`, {
-      encoding: "utf8",
-    });
+    // Same stale-id hazard as the spawn path (see resolveCallerSurface): renaming
+    // through a dead surface throws, and a cosmetic tab title must never fail a
+    // turn. Fall back to the focused surface.
+    const surfaceId = liveCallerSurface();
+    const target = surfaceId ? ["--surface", surfaceId] : [];
+    execFileSync("cmux", ["rename-tab", ...target, title], { encoding: "utf8" });
     return;
   }
 
