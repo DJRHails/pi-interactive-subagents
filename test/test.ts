@@ -2690,3 +2690,104 @@ describe("watchSubagent lifecycle detach", () => {
     runningMap.clear();
   });
 });
+
+describe("orphan breadcrumb + reattach (recovers subagents lost to a lifecycle detach)", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("breadcrumbs a non-interactive entry on detach, but never an interactive one", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-orphan-breadcrumb-"));
+    const artifactDir = testApi.getArtifactDir(dir, "sess1");
+    const controller = new AbortController();
+    controller.abort();
+
+    const nonInteractive = {
+      id: "orphan-a",
+      name: "Orphan A",
+      task: "t",
+      surface: "headless:orphan-a",
+      startTime: 0,
+      sessionFile: join(dir, "a.jsonl"),
+      artifactDir,
+      interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+    };
+    await testApi.watchSubagent(nonInteractive, controller.signal, {
+      async pollForExit() {
+        throw new Error("Aborted while waiting for subagent to finish");
+      },
+      closeSurface() {
+        throw new Error("must not close on a lifecycle detach");
+      },
+    });
+    const breadcrumbPath = join(artifactDir, "subagent-orphans", "orphan-a.json");
+    assert.ok(existsSync(breadcrumbPath), "non-interactive detach must leave a breadcrumb");
+
+    const interactive = { ...nonInteractive, id: "orphan-b", interactive: true };
+    await testApi.watchSubagent(interactive, controller.signal, {
+      async pollForExit() {
+        throw new Error("Aborted while waiting for subagent to finish");
+      },
+      closeSurface() {
+        throw new Error("must not close on a lifecycle detach");
+      },
+    });
+    assert.equal(
+      existsSync(join(artifactDir, "subagent-orphans", "orphan-b.json")),
+      false,
+      "interactive agents must never be breadcrumbed — the user may be driving one directly",
+    );
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reattachOrphanedSubagents resumes a breadcrumbed subagent and delivers its result on the next session_start", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-orphan-reattach-"));
+    const sessionId = "sess-reattach";
+    const artifactDir = testApi.getArtifactDir(dir, sessionId);
+    const childSessionFile = join(dir, "child.jsonl");
+
+    testApi.writeOrphanBreadcrumb({
+      id: "orphan-c",
+      name: "Orphan C",
+      task: "finish the review",
+      surface: "headless:orphan-c",
+      startTime: Date.now(),
+      sessionFile: childSessionFile,
+      artifactDir,
+      interactive: false,
+    });
+    // The subagent finished while nobody was watching — mirrors the `.exit`
+    // sidecars found unconsumed on disk in the real incident this fixes.
+    writeFileSync(`${childSessionFile}.exit`, JSON.stringify({ type: "exit", exitCode: 0 }));
+
+    const { api, sentMessages } = createMockExtensionApi();
+    const ctx = {
+      sessionManager: {
+        getSessionFile: () => join(dir, "parent.jsonl"),
+        getSessionId: () => sessionId,
+        getSessionDir: () => dir,
+      },
+    };
+
+    testApi.reattachOrphanedSubagents(api, ctx);
+    assert.equal(
+      existsSync(join(artifactDir, "subagent-orphans", "orphan-c.json")),
+      false,
+      "breadcrumb must be consumed immediately on reattach",
+    );
+
+    for (let i = 0; i < 40 && sentMessages.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    assert.equal(sentMessages.length, 1, "the recovered subagent must be delivered exactly once");
+    const [{ message, options }] = sentMessages;
+    assert.equal(message.customType, "subagent_result");
+    assert.equal(options.triggerTurn, true, "must wake the parent with a new turn");
+    assert.equal(options.deliverAs, "steer");
+    assert.match(message.content, /Orphan C/);
+    assert.equal(existsSync(`${childSessionFile}.exit`), false, "the exit sidecar must be consumed");
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
