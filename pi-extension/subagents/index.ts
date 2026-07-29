@@ -420,6 +420,84 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
+/**
+ * Breadcrumbs for non-interactive subagents whose watcher was aborted by a
+ * lifecycle detach (reload/switch/quit) before they finished. Without this,
+ * a detach permanently orphans the subagent: the in-memory `runningSubagents`
+ * map that would have delivered its result and closed its pane is gone, and
+ * nothing ever looks at it again — even after it finishes and writes its
+ * `.exit` sidecar. `session_start` reads these back and resumes watching
+ * (see `reattachOrphanedSubagents`). Interactive subagents are deliberately
+ * never breadcrumbed here — the user may be driving one directly in its pane,
+ * and auto-resuming a watcher on it is not this fix's job.
+ */
+interface OrphanBreadcrumb {
+  id: string;
+  name: string;
+  task: string;
+  agent?: string;
+  surface: string;
+  startTime: number;
+  sessionFile: string;
+  launchScriptFile?: string;
+  activityFile?: string;
+  cli?: string;
+  sentinelFile?: string;
+}
+
+function getOrphanDir(artifactDir: string): string {
+  return join(artifactDir, "subagent-orphans");
+}
+
+function writeOrphanBreadcrumb(running: RunningSubagent): void {
+  try {
+    const dir = getOrphanDir(running.artifactDir);
+    mkdirSync(dir, { recursive: true });
+    const breadcrumb: OrphanBreadcrumb = {
+      id: running.id,
+      name: running.name,
+      task: running.task,
+      agent: running.agent,
+      surface: running.surface,
+      startTime: running.startTime,
+      sessionFile: running.sessionFile,
+      launchScriptFile: running.launchScriptFile,
+      activityFile: running.activityFile,
+      cli: running.cli,
+      sentinelFile: running.sentinelFile,
+    };
+    writeFileSync(join(dir, `${running.id}.json`), JSON.stringify(breadcrumb));
+  } catch {
+    // Best-effort: losing the breadcrumb just means this one orphan stays
+    // unrecovered, same as before this fix existed.
+  }
+}
+
+/** Read and clear every orphan breadcrumb for one session's artifact dir. */
+function readAndClearOrphanBreadcrumbs(artifactDir: string): OrphanBreadcrumb[] {
+  const dir = getOrphanDir(artifactDir);
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const breadcrumbs: OrphanBreadcrumb[] = [];
+  for (const file of files) {
+    const full = join(dir, file);
+    try {
+      breadcrumbs.push(JSON.parse(readFileSync(full, "utf8")));
+    } catch {
+      // Corrupt breadcrumb — drop it rather than retrying forever.
+    } finally {
+      try {
+        unlinkSync(full);
+      } catch {}
+    }
+  }
+  return breadcrumbs;
+}
+
 const statusConfig = loadStatusConfig();
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
@@ -505,6 +583,8 @@ interface RunningSubagent {
   surface: string;
   startTime: number;
   sessionFile: string;
+  /** Parent session's artifact dir — where orphan breadcrumbs are written. */
+  artifactDir: string;
   launchScriptFile?: string;
   activityFile?: string;
   activity?: SubagentActivityState;
@@ -1032,6 +1112,11 @@ export const __test__ = {
   runningSubagents,
   formatElapsed,
   watchSubagent,
+  getArtifactDir,
+  writeOrphanBreadcrumb,
+  readAndClearOrphanBreadcrumbs,
+  watchAndDeliverSubagent,
+  reattachOrphanedSubagents,
 };
 
 function startWidgetRefresh() {
@@ -1191,6 +1276,7 @@ async function launchSubagent(
       surface,
       startTime,
       sessionFile: subagentSessionFile,
+      artifactDir,
       launchScriptFile,
       cli: "claude",
       sentinelFile,
@@ -1336,6 +1422,7 @@ async function launchSubagent(
     surface,
     startTime,
     sessionFile: subagentSessionFile,
+    artifactDir,
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
@@ -1486,8 +1573,18 @@ async function watchSubagent(
     // an interactive one). NEVER close the surface on a detach — doing so
     // previously nuked every running agent whenever the parent reloaded or
     // switched sessions. Just stop watching; leave the pane running.
+    //
+    // For non-interactive (batch/one-shot) subagents there is no one at the
+    // keyboard to lose — but without a breadcrumb the in-memory tracking that
+    // would have delivered its result and closed its pane is gone for good,
+    // even after it finishes and writes its `.exit` sidecar. Leave a
+    // breadcrumb so the next `session_start` on this same session can resume
+    // watching it (see `reattachOrphanedSubagents`).
     if (!reaped && (signal.aborted || moduleSignal.aborted)) {
       runningSubagents.delete(running.id);
+      if (!running.interactive) {
+        writeOrphanBreadcrumb(running);
+      }
       return {
         name,
         task,
@@ -1528,6 +1625,126 @@ async function watchSubagent(
   }
 }
 
+/**
+ * Watch a running subagent and deliver its outcome to the parent session as a
+ * steer message — ping, result, or (on a thrown watcher error) an error
+ * message. Shared by the initial spawn and by `reattachOrphanedSubagents`, so
+ * a subagent picked back up after a lifecycle detach is delivered exactly the
+ * same way as one that was watched continuously.
+ */
+function watchAndDeliverSubagent(pi: ExtensionAPI, running: RunningSubagent, signal: AbortSignal): void {
+  watchSubagent(running, signal)
+    .then((result) => {
+      updateWidget(); // reflect removal from Map immediately
+
+      // Parent reloaded / switched session: child pane left running, do
+      // not steer a result or trigger a turn.
+      if (result.detached) return;
+
+      if (result.ping) {
+        // Subagent is requesting help — steer a ping message with session path for resume
+        const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+        pi.sendMessage(
+          {
+            customType: "subagent_ping",
+            content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
+            display: true,
+            details: {
+              name: result.ping.name,
+              message: result.ping.message,
+              agent: running.agent,
+              sessionFile: result.sessionFile,
+            },
+          },
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+        return;
+      }
+
+      const presentation = resolveResultPresentation(result, running.name);
+
+      pi.sendMessage(
+        {
+          customType: "subagent_result",
+          content: presentation,
+          display: true,
+          details: {
+            name: running.name,
+            task: running.task,
+            agent: running.agent,
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            sessionFile: result.sessionFile,
+            ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+            ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+          },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    })
+    .catch((err) => {
+      updateWidget();
+      pi.sendMessage(
+        {
+          customType: "subagent_result",
+          content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+          display: true,
+          details: { name: running.name, task: running.task, error: err?.message },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    });
+}
+
+/**
+ * Resume watching subagents orphaned by a lifecycle detach in a *previous*
+ * module instance (see `writeOrphanBreadcrumb` in watchSubagent's catch
+ * block). Runs on every `session_start` for the current session's artifact
+ * dir; a no-op when there are no breadcrumbs. Only covers detaches that
+ * preserved the session id — `/reload` and resuming back into the same
+ * session file — since a breadcrumb is keyed by the session id of the
+ * runtime that wrote it. `/new` and `/fork` mint a new session id and won't
+ * find breadcrumbs left by the session they branched from.
+ */
+function reattachOrphanedSubagents(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  if (!sessionFile) return;
+  const sessionId = ctx.sessionManager.getSessionId();
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+  const breadcrumbs = readAndClearOrphanBreadcrumbs(artifactDir);
+  if (breadcrumbs.length === 0) return;
+
+  for (const b of breadcrumbs) {
+    if (runningSubagents.has(b.id)) continue; // already tracked somehow — don't double-watch
+    const running: RunningSubagent = {
+      id: b.id,
+      name: b.name,
+      task: b.task,
+      agent: b.agent,
+      surface: b.surface,
+      startTime: b.startTime,
+      sessionFile: b.sessionFile,
+      artifactDir,
+      launchScriptFile: b.launchScriptFile,
+      activityFile: b.activityFile,
+      interactive: false, // only non-interactive agents are ever breadcrumbed
+      statusState: createStatusState({
+        source: b.cli === "claude" ? "claude" : "pi",
+        startTimeMs: b.startTime,
+      }),
+      cli: b.cli,
+      sentinelFile: b.sentinelFile,
+    };
+    runningSubagents.set(b.id, running);
+
+    const watcherAbort = new AbortController();
+    running.abortController = watcherAbort;
+    startWidgetRefresh();
+    startStatusRefresh(pi);
+    watchAndDeliverSubagent(pi, running, watcherAbort.signal);
+  }
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Without a usable multiplexer session (inside cmux/tmux/zellij/WezTerm —
   // binaries alone don't count, see cmux.ts runtime checks) or without an
@@ -1545,6 +1762,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    reattachOrphanedSubagents(pi, ctx);
   });
 
   // Clean up on session shutdown
@@ -1644,67 +1862,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startStatusRefresh(pi);
 
         // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            updateWidget(); // reflect removal from Map immediately
-
-            // Parent reloaded / switched session: child pane left running, do
-            // not steer a result or trigger a turn.
-            if (result.detached) return;
-
-            if (result.ping) {
-              // Subagent is requesting help — steer a ping message with session path for resume
-              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
-              pi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    agent: running.agent,
-                    sessionFile: result.sessionFile,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
-
-            const presentation = resolveResultPresentation(result, running.name);
-
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
+        watchAndDeliverSubagent(pi, running, watcherAbort.signal);
 
         // Return immediately
         return {
@@ -2064,6 +2222,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           surface,
           startTime,
           sessionFile: params.sessionPath,
+          artifactDir,
           launchScriptFile,
           activityFile,
           interactive,
