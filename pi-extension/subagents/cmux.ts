@@ -530,6 +530,7 @@ function createZellijSurface(name: string): string {
 type CmuxFocusSnapshot = {
   surfaceRef?: string;
   paneRef?: string;
+  workspaceRef?: string;
 };
 
 type CmuxCreatedSurface = {
@@ -552,12 +553,19 @@ export function parseCmuxFocusedSnapshot(value: unknown): CmuxFocusSnapshot | nu
   const focused = (value as { focused?: unknown }).focused;
   if (!focused || typeof focused !== "object") return null;
 
-  const record = focused as { surface_ref?: unknown; pane_ref?: unknown };
+  const record = focused as {
+    surface_ref?: unknown;
+    pane_ref?: unknown;
+    workspace_ref?: unknown;
+  };
   const surfaceRef = nonEmptyString(record.surface_ref) ? record.surface_ref : undefined;
   const paneRef = nonEmptyString(record.pane_ref) ? record.pane_ref : undefined;
+  const workspaceRef = nonEmptyString(record.workspace_ref) ? record.workspace_ref : undefined;
 
   if (!surfaceRef && !paneRef) return null;
-  return { surfaceRef, paneRef };
+  // Spread rather than always setting the key: callers deep-compare these
+  // snapshots, so an absent workspace must stay absent, not become undefined.
+  return { surfaceRef, paneRef, ...(workspaceRef ? { workspaceRef } : {}) };
 }
 
 export function parseCmuxJson(value: string): unknown | null {
@@ -710,21 +718,216 @@ function renameCmuxSurface(surface: string, name: string): void {
   execFileSync("cmux", ["rename-tab", "--surface", surface, name], { encoding: "utf8" });
 }
 
+/**
+ * True when cmux's live tree still contains this surface/pane ref.
+ *
+ * Only sound for *refs* (`surface:30`, `pane:8`). `cmux tree` prints refs and
+ * never ids, so passing the UUID form of either — which is what the
+ * `CMUX_SURFACE_ID` and `CMUX_WORKSPACE_ID` environment variables hold — always
+ * returns false. Use resolveCmuxCaller for those.
+ */
+function cmuxRefExists(ref: string): boolean {
+  try {
+    return execSync(`cmux tree`, { encoding: "utf8" }).includes(ref);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ask cmux to resolve the calling surface, and take its workspace from the answer.
+ *
+ * The environment gives a surface id and a workspace id, and only one of them
+ * can be trusted. `CMUX_SURFACE_ID` survives everything — verified against cmux
+ * 0.64.20, where the id held since process start still resolved to a live
+ * surface. `CMUX_WORKSPACE_ID` does not: cmux re-mints workspaces across
+ * restores and updates, and the variable is never refreshed.
+ *
+ * That matters more than it sounds, because `identify --surface` resolves a
+ * surface *within* the environment's workspace. A stale workspace therefore
+ * makes a perfectly live surface report `caller: null`, and the obvious reading
+ * of that — the surface is gone — is wrong.
+ *
+ * Which leaves a chicken and egg: the lookup needs the surface's workspace, and
+ * the workspace is the part that went stale. Neither `tree` nor `tree --json`
+ * prints surface ids, so there is no map from the id we hold to the ref we
+ * need, and the focused workspace only works when the caller happens to be
+ * focused — which it is not, whenever you spawn from a background tab. So every
+ * workspace is tried until one resolves the surface; the workspace that answers
+ * is by construction the one the caller lives in.
+ *
+ * Returns the caller's surface ref, or undefined to mean "split from focus".
+ * Costs one cmux call per workspace, so callers should resolve this once.
+ */
+export function resolveCmuxCaller(
+  env: NodeJS.ProcessEnv,
+  workspaceRefs: readonly string[],
+  identifySurfaceIn: (workspaceRef: string, surfaceId: string) => CmuxFocusSnapshot | null,
+): string | undefined {
+  const surfaceId = env.CMUX_SURFACE_ID;
+  if (!surfaceId) return undefined;
+  for (const workspaceRef of workspaceRefs) {
+    const caller = identifySurfaceIn(workspaceRef, surfaceId);
+    if (caller?.surfaceRef) {
+      env.CMUX_WORKSPACE_ID = workspaceRef;
+      return caller.surfaceRef;
+    }
+  }
+  return undefined;
+}
+
+/** Resolve one surface id inside one workspace; cmux is the only authority. */
+function identifyCmuxSurfaceIn(workspaceRef: string, surfaceId: string): CmuxFocusSnapshot | null {
+  try {
+    return parseCmuxCallerSnapshot(
+      execFileSync("cmux", ["identify", "--json", "--surface", surfaceId], {
+        encoding: "utf8",
+        env: { ...process.env, CMUX_WORKSPACE_ID: workspaceRef },
+      }),
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** Workspace refs in cmux's live tree, focused one first so the common case is one call. */
+function liveWorkspaceRefs(): string[] {
+  let tree = "";
+  try {
+    tree = execSync(`cmux tree`, { encoding: "utf8" });
+  } catch {
+    return [];
+  }
+  const refs = [...new Set(tree.match(/workspace:\d+/g) ?? [])];
+  const focused = captureCmuxIdentifySnapshot().focused?.workspaceRef;
+  return focused ? [focused, ...refs.filter((r) => r !== focused)] : refs;
+}
+
+let cachedCallerSurface: string | undefined | null = null;
+
+function liveCallerSurface(): string | undefined {
+  // Memoised: this costs a cmux call per workspace, and a spawn asks more than once.
+  if (cachedCallerSurface !== null) return cachedCallerSurface;
+  cachedCallerSurface = resolveCmuxCaller(process.env, liveWorkspaceRefs(), identifyCmuxSurfaceIn);
+  return cachedCallerSurface;
+}
+
+/**
+ * Pick the workspace a new split belongs to, discarding a stale id.
+ *
+ * `cmux new-split` defaults `--workspace` to `$CMUX_WORKSPACE_ID`, which goes
+ * stale for exactly the same reasons `$CMUX_SURFACE_ID` does — and usually at
+ * the same moment, since a restore or rename re-mints both. Dropping only the
+ * dead `--surface` therefore was not enough: the retry still resolved the
+ * workspace from the dead env var, so the fallback failed too, with
+ * `not_found: Workspace not found`. Observed on cmux 0.64.20 against a session
+ * that outlived a cmux update:
+ *
+ *     cmux new-split right                        -> Workspace not found
+ *     cmux new-split right --surface surface:1    -> Workspace not found
+ *     cmux new-split right --workspace workspace:1 -> OK surface:59 workspace:1
+ *
+ * Pure so it can be tested without a live cmux.
+ */
+export function resolveCallerWorkspace(
+  envWorkspaceId: string | undefined,
+  focusedWorkspaceRef: string | undefined,
+  workspaceExists: (ref: string) => boolean,
+): string | undefined {
+  if (envWorkspaceId && workspaceExists(envWorkspaceId)) return undefined;
+  return focusedWorkspaceRef;
+}
+
+/**
+ * Point `$CMUX_WORKSPACE_ID` at a workspace that exists, once per process.
+ *
+ * Every `cmux` subcommand defaults `--workspace` to this variable, and there
+ * are ten of them here — `new-split`, `rename-tab` twice, `new-surface`,
+ * `send` twice, `read-screen`, `close-surface`, `workspace-action`. Passing the
+ * flag explicitly at one call site only moved the failure to the next one:
+ * `new-split` started working and the spawn then died renaming the tab. Some of
+ * those calls are built as shell strings, so threading a flag through all of
+ * them is both invasive and easy to miss one.
+ *
+ * Repairing the variable instead fixes every call at once, including future
+ * ones, because `execSync`/`execFileSync` hand `process.env` to the child and
+ * cmux resolves its own default from there. Mutating the environment is
+ * normally worth avoiding, but here the variable is *already wrong* — it names
+ * a workspace cmux destroyed — so correcting it is closer to repair than to a
+ * side effect.
+ *
+ * Memoised: the lookup shells out to `cmux identify`, and a spawn makes several
+ * calls in a row.
+ */
+let workspaceEnvRepaired = false;
+
+export function repairWorkspaceEnv(
+  env: NodeJS.ProcessEnv,
+  focusedWorkspaceRef: string | undefined,
+  workspaceExists: (ref: string) => boolean,
+): string | undefined {
+  const live = resolveCallerWorkspace(env.CMUX_WORKSPACE_ID, focusedWorkspaceRef, workspaceExists);
+  if (live) env.CMUX_WORKSPACE_ID = live;
+  return live;
+}
+
+function ensureLiveWorkspaceEnv(): void {
+  if (workspaceEnvRepaired) return;
+  workspaceEnvRepaired = true;
+  const repaired = repairWorkspaceEnv(
+    process.env,
+    captureCmuxIdentifySnapshot().focused?.workspaceRef,
+    cmuxRefExists,
+  );
+  if (repaired) {
+    console.error(
+      `[interactive-subagents] CMUX_WORKSPACE_ID named a workspace cmux no longer has; ` +
+        `using the focused workspace ${repaired} instead`,
+    );
+  }
+}
+
+
+
+function runCmuxNewSplit(
+  direction: "left" | "right" | "up" | "down",
+  fromSurface?: string,
+): string {
+  if (fromSurface) {
+    try {
+      return execFileSync("cmux", ["new-split", direction, "--surface", fromSurface], {
+        encoding: "utf8",
+      }).trim();
+    } catch (error) {
+      console.error(
+        `[interactive-subagents] cmux new-split from surface ${fromSurface} failed ` +
+          `(${error instanceof Error ? error.message : String(error)}); ` +
+          `retrying from the focused surface`,
+      );
+    }
+  }
+  // No `--workspace` needed: ensureLiveWorkspaceEnv has already corrected the
+  // variable cmux resolves its default from, for this call and every other.
+  return execFileSync("cmux", ["new-split", direction], { encoding: "utf8" }).trim();
+}
+
 function createCmuxSplitSurface(
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): CmuxCreatedSurface {
+  ensureLiveWorkspaceEnv();
   const identifySnapshot = captureCmuxIdentifySnapshot();
   const focusSnapshot = identifySnapshot.focused;
   const callerSnapshot = identifySnapshot.caller;
   let child: CmuxCreatedSurface | null = null;
 
   try {
-    const args = ["new-split", direction];
-    if (fromSurface) args.push("--surface", fromSurface);
-
-    const output = execFileSync("cmux", args, { encoding: "utf8" }).trim();
+    // `fromSurface` is checked against the live tree before we get here, but the
+    // surface can still die in between (a rename or restore lands mid-spawn), so
+    // a failed targeted split retries from the focused surface rather than
+    // taking the whole spawn down with it.
+    const output = runCmuxNewSplit(direction, fromSurface);
     child = parseCmuxCreatedSurface(output, "new-split");
     child.paneRef ??= readCmuxPaneRefForSurface(child.surface) ?? undefined;
     renameCmuxSurface(child.surface, name);
@@ -754,6 +957,11 @@ function createCmuxSplitSurface(
 export function createSurface(name: string): string {
   const backend = getMuxBackend();
 
+  // Before the first cmux call of a spawn, not inside one: `new-surface`,
+  // `rename-tab`, `send` and `read-screen` all resolve their workspace from the
+  // environment too, so the repair has to precede whichever path is taken.
+  if (backend === "cmux") ensureLiveWorkspaceEnv();
+
   if (backend === "cmux" && cmuxSubagentPane) {
     // Verify the pane still exists before adding a tab to it
     try {
@@ -767,7 +975,7 @@ export function createSurface(name: string): string {
   }
 
   if (backend === "cmux") {
-    const created = createCmuxSplitSurface(name, "right", process.env.CMUX_SURFACE_ID);
+    const created = createCmuxSplitSurface(name, "right", liveCallerSurface());
     cmuxSubagentPane = created.paneRef ?? null;
     return created.surface;
   }
@@ -911,11 +1119,12 @@ export function renameCurrentTab(title: string): void {
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
-    const surfaceId = process.env.CMUX_SURFACE_ID;
-    if (!surfaceId) throw new Error("CMUX_SURFACE_ID not set");
-    execSync(`cmux rename-tab --surface ${shellEscape(surfaceId)} ${shellEscape(title)}`, {
-      encoding: "utf8",
-    });
+    // Same stale-id hazard as the spawn path (see resolveCallerSurface): renaming
+    // through a dead surface throws, and a cosmetic tab title must never fail a
+    // turn. Fall back to the focused surface.
+    const surfaceId = liveCallerSurface();
+    const target = surfaceId ? ["--surface", surfaceId] : [];
+    execFileSync("cmux", ["rename-tab", ...target, title], { encoding: "utf8" });
     return;
   }
 

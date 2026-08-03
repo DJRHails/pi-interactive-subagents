@@ -26,6 +26,9 @@ import {
   parseCmuxJson,
   parseCmuxPaneRefForSurface,
   parseCmuxPaneRefForSurfaceFromJson,
+  resolveCmuxCaller,
+  resolveCallerWorkspace,
+  repairWorkspaceEnv,
   canSplitZellijPane,
   predictZellijSplitDirection,
   selectZellijPlacement,
@@ -2086,6 +2089,64 @@ describe("subagents widget rendering", () => {
 });
 
 describe("cmux.ts", () => {
+  describe("resolveCmuxCaller", () => {
+    // The caller lives in workspace:15 while workspace:9 holds focus — the
+    // ordinary case of spawning from a background tab, taken from a live cmux.
+    const inWorkspace15 = (ws: string) =>
+      ws === "workspace:15" ? { surfaceRef: "surface:30" } : null;
+    const workspaces = ["workspace:9", "workspace:2", "workspace:15"];
+
+    it("finds the caller surface that the old tree grep always threw away", () => {
+      // `cmux tree` prints refs (surface:30) while CMUX_SURFACE_ID holds a UUID,
+      // so the previous existence check could never match. It discarded the
+      // caller on every spawn, and every split silently came off the focused
+      // tab instead — the misplacement the check was written to prevent.
+      const env = { CMUX_SURFACE_ID: "DE888FB9-UUID", CMUX_WORKSPACE_ID: "dead-uuid" };
+      assert.equal(resolveCmuxCaller(env, workspaces, inWorkspace15), "surface:30");
+    });
+
+    it("repairs the workspace to whichever one resolved the surface", () => {
+      // The workspace that answers is by construction the caller's own, so it
+      // is more authoritative than the focused one.
+      const env = { CMUX_SURFACE_ID: "DE888FB9-UUID", CMUX_WORKSPACE_ID: "dead-uuid" };
+      resolveCmuxCaller(env, workspaces, inWorkspace15);
+      assert.equal(env.CMUX_WORKSPACE_ID, "workspace:15");
+    });
+
+    it("stops at the first workspace that resolves", () => {
+      const env = { CMUX_SURFACE_ID: "DE888FB9-UUID" };
+      const tried: string[] = [];
+      resolveCmuxCaller(env, workspaces, (ws, id) => {
+        tried.push(ws);
+        return inWorkspace15(ws, id);
+      });
+      assert.deepEqual(tried, ["workspace:9", "workspace:2", "workspace:15"]);
+    });
+
+    it("leaves the workspace alone when no workspace resolves the surface", () => {
+      // A genuinely dead surface: fall back to focus and let cmux decide.
+      const env = { CMUX_SURFACE_ID: "DE888FB9-UUID", CMUX_WORKSPACE_ID: "dead-uuid" };
+      assert.equal(
+        resolveCmuxCaller(env, workspaces, () => null),
+        undefined,
+      );
+      assert.equal(env.CMUX_WORKSPACE_ID, "dead-uuid");
+    });
+
+    it("skips the scan entirely when no surface id is exported", () => {
+      const env: NodeJS.ProcessEnv = { CMUX_WORKSPACE_ID: "dead-uuid" };
+      let called = false;
+      assert.equal(
+        resolveCmuxCaller(env, workspaces, () => {
+          called = true;
+          return { surfaceRef: "surface:30" };
+        }),
+        undefined,
+      );
+      assert.equal(called, false);
+    });
+  });
+
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
@@ -2374,5 +2435,67 @@ describe("cmux.ts", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
     });
+  });
+});
+
+describe("resolveCallerWorkspace", () => {
+
+  it("resolveCallerWorkspace defers to the env workspace while it is live", () => {
+  const live = (ref: string) => ref === "live-workspace";
+  assert.equal(resolveCallerWorkspace("live-workspace", "workspace:1", live), undefined);
+  });
+
+  it("resolveCallerWorkspace names the focused workspace when the env one is stale", () => {
+  const live = (ref: string) => ref === "live-workspace";
+  // `cmux new-split` defaults --workspace to $CMUX_WORKSPACE_ID, so a stale env
+  // var breaks the fallback split too, not just the targeted one.
+  assert.equal(resolveCallerWorkspace("dead-workspace", "workspace:1", live), "workspace:1");
+  });
+
+  it("resolveCallerWorkspace falls back when no workspace env var is set", () => {
+  assert.equal(resolveCallerWorkspace(undefined, "workspace:1", () => false), "workspace:1");
+  });
+
+  it("resolveCallerWorkspace yields nothing when cmux reports no focus either", () => {
+  assert.equal(resolveCallerWorkspace("dead-workspace", undefined, () => false), undefined);
+  });
+
+  it("parseCmuxFocusedSnapshot keeps the focused workspace ref", () => {
+  const snapshot = parseCmuxFocusedSnapshot({
+    focused: { surface_ref: "surface:1", pane_ref: "pane:1", workspace_ref: "workspace:1" },
+    });
+  assert.equal(snapshot?.workspaceRef, "workspace:1");
+  });
+});
+
+describe("repairWorkspaceEnv", () => {
+  const live = (ref: string) => ref === "workspace:1";
+
+  it("rewrites a stale CMUX_WORKSPACE_ID so every cmux call inherits a live one", () => {
+    // The variable is what cmux resolves --workspace from, and ten call sites
+    // rely on that default; repairing it fixes all of them at once.
+    const env = { CMUX_WORKSPACE_ID: "dead-uuid" };
+    assert.equal(repairWorkspaceEnv(env, "workspace:1", live), "workspace:1");
+    assert.equal(env.CMUX_WORKSPACE_ID, "workspace:1");
+  });
+
+  it("leaves a live CMUX_WORKSPACE_ID untouched", () => {
+    const env = { CMUX_WORKSPACE_ID: "workspace:1" };
+    assert.equal(repairWorkspaceEnv(env, "workspace:9", live), undefined);
+    assert.equal(env.CMUX_WORKSPACE_ID, "workspace:1");
+  });
+
+  it("fills in a missing CMUX_WORKSPACE_ID from the focused workspace", () => {
+    const env: NodeJS.ProcessEnv = {};
+    assert.equal(repairWorkspaceEnv(env, "workspace:1", live), "workspace:1");
+    assert.equal(env.CMUX_WORKSPACE_ID, "workspace:1");
+  });
+
+  it("leaves the variable alone when cmux reports no focused workspace", () => {
+    // Better a stale value than an undefined one: the stale id at least
+    // produces cmux's own not_found error rather than a confusing default.
+    const env = { CMUX_WORKSPACE_ID: "dead-uuid" };
+    assert.equal(repairWorkspaceEnv(env, undefined, live), undefined);
+    assert.equal(env.CMUX_WORKSPACE_ID, "dead-uuid");
   });
 });
