@@ -75,8 +75,23 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
   }
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
+  rotatePollAbortGeneration();
+}
+
+/**
+ * Abort every poll loop belonging to the current session generation and arm a
+ * fresh controller for the next one.
+ *
+ * Aborting without re-arming poisons the process: `session_shutdown` fires on
+ * quit, /reload, /new, /resume and /fork, but only /reload re-executes this
+ * module (pi clears its extension cache and re-imports; a session switch reuses
+ * the cached factory). After the first /new or /resume, every later watcher
+ * would be born with an already-aborted signal, so pollForExit throws on its
+ * first tick and the sub-agent's result is never delivered to the parent.
+ */
+function rotatePollAbortGeneration(): void {
+  const previous = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
+  previous?.abort();
   (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
 }
 
@@ -1375,8 +1390,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
+    rotatePollAbortGeneration();
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
     }
