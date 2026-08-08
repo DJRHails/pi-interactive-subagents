@@ -68,6 +68,26 @@ export function findLatestAssistantError(
   return null;
 }
 
+/**
+ * Decide whether the subagent should terminate when the agent loop ends.
+ *
+ * An errored turn (typically auto-retry exhausted on a provider overload /
+ * rate limit) ALWAYS terminates — even an interactive subagent — so the parent
+ * is notified via the `.exit` sidecar and the dead pane does not linger waiting
+ * for input that will never come. A normal completion still respects `autoExit`:
+ * interactive agents stay open for the user to keep driving.
+ */
+export function resolveAgentEndExit(
+  autoExit: boolean,
+  userTookOver: boolean,
+  messages: any[] | undefined,
+): { shouldExit: boolean; errorInfo: SubagentErrorInfo | null } {
+  const errorInfo = findLatestAssistantError(messages);
+  const shouldExit =
+    errorInfo != null || (autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages));
+  return { shouldExit, errorInfo };
+}
+
 export function parseDeniedTools(rawValue: string | undefined): string[] {
   return (rawValue ?? "")
     .split(",")
@@ -173,7 +193,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    // Errored turns terminate even an interactive subagent (autoExit=false) so
+    // the parent is woken and the dead pane auto-closes; normal completion
+    // still respects autoExit.
+    const { shouldExit, errorInfo } = resolveAgentEndExit(autoExit, userTookOver, messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -181,7 +204,6 @@ export default function (pi: ExtensionAPI) {
       // can report a clear failure with the underlying error message.
       // Without this the parent would only see exit code 0 and a stale
       // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (errorInfo && sessionFile) {
         try {
