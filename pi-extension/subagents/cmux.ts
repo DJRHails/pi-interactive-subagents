@@ -555,9 +555,43 @@ function readZellijPanes(): ZellijPaneSnapshot[] {
   throw lastError;
 }
 
+/** Terminal (non-plugin) pane ids from a snapshot — the id space `new-pane` returns. */
+function terminalPaneIds(panes: ZellijPaneSnapshot[]): number[] {
+  return panes.filter((pane) => !pane.is_plugin).map((pane) => pane.id);
+}
+
+/**
+ * Create a pane and return its surface, robust to zellij's `new-pane` action not
+ * echoing the new pane id on stdout. In a crowded / auto-stacking tab `new-pane`
+ * returns an empty string even though it DID create the pane; the old parse-only
+ * path then threw ("Unexpected zellij pane id ... (empty)") and orphaned it,
+ * which filled the tab and made the next spawn fail too. Recover by diffing the
+ * terminal-pane id set before/after: the created pane is the id present after but
+ * not before. Placement is already serialised by withZellijSurfaceLock, so at
+ * most one terminal pane appears per call; if more than one somehow does, the
+ * newest (max id) is the best-effort choice.
+ */
+function createZellijPaneRecovering(
+  args: string[],
+  context: string,
+  anchorSurface?: string,
+): string {
+  const idsBefore = new Set(terminalPaneIds(readZellijPanes()));
+  const raw = zellijActionSync(args, anchorSurface).trim();
+  if (/\d/.test(raw)) return parseZellijPaneSurface(raw, context);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const fresh = terminalPaneIds(readZellijPanes()).filter((id) => !idsBefore.has(id));
+    if (fresh.length > 0) return `pane:${Math.max(...fresh)}`;
+    sleepSync(50);
+  }
+  throw new Error(
+    `Unexpected zellij pane id from ${context}: ${raw || "(empty)"} and no new pane appeared`,
+  );
+}
+
 function createZellijTiledPane(name: string, tabId: number): string {
   const args = ["new-pane", "--tab-id", String(tabId), "--name", name, "--cwd", process.cwd()];
-  return parseZellijPaneSurface(zellijActionSync(args).trim(), "new-pane");
+  return createZellijPaneRecovering(args, "new-pane");
 }
 
 function createZellijStackedPane(name: string, anchorSurface: string): string {
@@ -570,7 +604,7 @@ function createZellijStackedPane(name: string, anchorSurface: string): string {
     "--cwd",
     process.cwd(),
   ];
-  return parseZellijPaneSurface(zellijActionSync(args, anchorSurface).trim(), "new-pane --stacked");
+  return createZellijPaneRecovering(args, "new-pane --stacked", anchorSurface);
 }
 
 function createZellijTab(name: string): string {
@@ -1047,18 +1081,16 @@ export function createSurfaceSplit(
   const directionArg = direction === "left" || direction === "right" ? "right" : "down";
   const args = ["new-pane", "--direction", directionArg, "--name", name, "--cwd", process.cwd()];
 
-  let rawId: string;
+  // Recover the id by pane-diff when `new-pane` returns empty stdout (crowded /
+  // auto-stacking tab), same as createZellijTiledPane; keep the fromSurface anchor
+  // fallback for when the anchored split is rejected.
+  let surface: string;
   try {
-    rawId = zellijActionSync(args, fromSurface).trim();
+    surface = createZellijPaneRecovering(args, "new-pane", fromSurface);
   } catch {
     if (!fromSurface) throw new Error("Failed to create zellij pane");
-    rawId = zellijActionSync(args).trim();
+    surface = createZellijPaneRecovering(args, "new-pane");
   }
-
-  // zellij returns the pane ID as e.g. "terminal_7" — extract the numeric part.
-  // Previously we sent `write-chars "echo $ZELLIJ_PANE_ID"` to a temp file, but
-  // `write-chars` without --pane-id targets the focused pane, which raced on tab switches.
-  const surface = parseZellijPaneSurface(rawId, "new-pane");
 
   if (direction === "left" || direction === "up") {
     try {
