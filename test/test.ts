@@ -1008,6 +1008,54 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("merges a global override onto the bundled def: override model, inherit body", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      const bundled = testApi.loadAgentDefaults("worker");
+      assert.ok(bundled?.body && bundled.body.length > 0, "bundled worker should have a role body");
+
+      // Frontmatter-only override (empty body) — exactly the shape the dotfiles
+      // stubs use so only `model:` changes and the bundled body is inherited.
+      writeAgentFile(
+        globalAgentsDir,
+        "worker",
+        ["name: worker", "model: anthropic-api/claude-opus-4-8[fast]"].join("\n"),
+        "",
+      );
+
+      const merged = testApi.loadAgentDefaults("worker");
+      assert.equal(
+        merged?.model,
+        "anthropic-api/claude-opus-4-8[fast]",
+        "the 2-line global stub overrides the bundled model",
+      );
+      assert.equal(merged?.body, bundled?.body, "bundled role body is inherited, not lost");
+      assert.equal(merged?.description, bundled?.description, "bundled description is inherited");
+    });
+  });
+
+  it("mergeAgentDefinition: override-set fields win, unset fields inherit", () => {
+    const base = {
+      name: "worker",
+      description: "bundled worker",
+      model: "anthropic/claude-sonnet-4-6",
+      tools: "read,edit,bash",
+      body: "You are the worker.",
+      interactive: false,
+      disableModelInvocation: false,
+    };
+    const override = {
+      name: "worker",
+      model: "anthropic-api/claude-opus-4-8[fast]",
+      disableModelInvocation: false,
+    };
+    const merged = testApi.mergeAgentDefinition(base, override);
+    assert.equal(merged.model, "anthropic-api/claude-opus-4-8[fast]", "override model wins");
+    assert.equal(merged.tools, "read,edit,bash", "unset tools inherited from base");
+    assert.equal(merged.body, "You are the worker.", "unset body inherited from base");
+    assert.equal(merged.description, "bundled worker", "unset description inherited from base");
+    assert.equal(merged.interactive, false);
+  });
+
   it("ignores invalid session-mode values", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
