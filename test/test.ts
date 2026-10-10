@@ -53,6 +53,7 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  resolveAgentEndExit,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
@@ -1290,6 +1291,46 @@ describe("subagent-done.ts", () => {
     it("returns null when messages is undefined or empty", () => {
       assert.equal(findLatestAssistantError(undefined), null);
       assert.equal(findLatestAssistantError([]), null);
+    });
+  });
+
+  describe("resolveAgentEndExit", () => {
+    const errored = [{ role: "assistant", stopReason: "error", errorMessage: "Anthropic 529 Overloaded" }];
+    const normal = [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }];
+    const aborted = [{ role: "assistant", stopReason: "aborted" }];
+
+    it("terminates an INTERACTIVE subagent on error and returns the error (the fix)", () => {
+      const r = resolveAgentEndExit(false, true, errored);
+      assert.equal(r.shouldExit, true);
+      assert.equal(r.errorInfo?.errorMessage, "Anthropic 529 Overloaded");
+    });
+
+    it("keeps an interactive subagent open on normal completion", () => {
+      const r = resolveAgentEndExit(false, true, normal);
+      assert.equal(r.shouldExit, false);
+      assert.equal(r.errorInfo, null);
+    });
+
+    it("keeps an interactive subagent open on user abort (Escape)", () => {
+      const r = resolveAgentEndExit(false, true, aborted);
+      assert.equal(r.shouldExit, false);
+      assert.equal(r.errorInfo, null);
+    });
+
+    it("auto-exits an autoExit subagent on normal completion", () => {
+      const r = resolveAgentEndExit(true, false, normal);
+      assert.equal(r.shouldExit, true);
+      assert.equal(r.errorInfo, null);
+    });
+
+    it("terminates an autoExit subagent on error", () => {
+      const r = resolveAgentEndExit(true, false, errored);
+      assert.equal(r.shouldExit, true);
+      assert.equal(r.errorInfo?.stopReason, "error");
+    });
+
+    it("does not auto-exit an autoExit subagent on user abort", () => {
+      assert.equal(resolveAgentEndExit(true, false, aborted).shouldExit, false);
     });
   });
 });
