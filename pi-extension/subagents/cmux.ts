@@ -1,6 +1,16 @@
-import { execSync, execFile, execFileSync, spawnSync } from "node:child_process";
+import { execSync, execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -95,6 +105,160 @@ export function getMuxBackend(): MuxBackend | null {
 
 export function isMuxAvailable(): boolean {
   return getMuxBackend() !== null;
+}
+
+// ── Headless (no-multiplexer) surfaces ──
+//
+// When no usable multiplexer session exists, subagents run as detached
+// background processes instead of panes. A "surface" is then just a handle to
+// the spawned process plus a log file that stands in for the terminal screen,
+// so the existing completion detection (session `.exit` sidecar + the
+// `__SUBAGENT_DONE_N__` sentinel scraped via readScreen) works unchanged.
+
+export type SurfaceBackend = MuxBackend | "headless";
+
+function headlessPreferred(): boolean {
+  return (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase() === "headless";
+}
+
+function hasInteractiveTerminal(): boolean {
+  return process.stdout.isTTY === true;
+}
+
+/**
+ * Decide where subagent surfaces are created. An auto-detected multiplexer is
+ * used only when the parent process also has an interactive terminal — a
+ * headless parent (`pi -p`, an RPC driver, CI, cron) can inherit stale mux env
+ * vars (TMUX/ZELLIJ/...) from the shell that spawned it and would then create
+ * panes it cannot host. An explicit `PI_SUBAGENT_MUX=<mux>` preference is a
+ * deliberate choice (users, test harness) and skips the terminal check, since
+ * mux servers accept pane commands from tty-less clients. Everything else
+ * falls back to detached background processes; `PI_SUBAGENT_MUX=headless`
+ * forces the fallback.
+ */
+export function resolveSurfaceBackend(
+  muxBackend: MuxBackend | null,
+  interactiveTerminal: boolean,
+  preferHeadless: boolean,
+  explicitMuxPreference: boolean,
+): SurfaceBackend {
+  if (preferHeadless || !muxBackend) return "headless";
+  if (!explicitMuxPreference && !interactiveTerminal) return "headless";
+  return muxBackend;
+}
+
+export function getSurfaceBackend(): SurfaceBackend {
+  return resolveSurfaceBackend(
+    getMuxBackend(),
+    hasInteractiveTerminal(),
+    headlessPreferred(),
+    muxPreference() !== null,
+  );
+}
+
+export function isHeadlessSurface(surface: string): boolean {
+  return surface.startsWith("headless:");
+}
+
+interface HeadlessSurfaceState {
+  logFile: string;
+  pid: number | null;
+}
+
+/** Live headless surfaces, keyed by surface id. In-memory only, like panes. */
+const headlessSurfaces = new Map<string, HeadlessSurfaceState>();
+let headlessSurfaceCounter = 0;
+
+function requireHeadlessSurface(surface: string): HeadlessSurfaceState {
+  const state = headlessSurfaces.get(surface);
+  if (!state) {
+    throw new Error(`Unknown headless surface: ${surface}`);
+  }
+  return state;
+}
+
+function createHeadlessSurface(name: string): string {
+  headlessSurfaceCounter += 1;
+  const id = `${headlessSurfaceCounter}-${Math.random().toString(16).slice(2, 8)}`;
+  const surface = `headless:${id}`;
+  const safeName =
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "subagent";
+  const logDir = join(tmpdir(), "pi-subagent-headless");
+  mkdirSync(logDir, { recursive: true });
+  const logFile = join(logDir, `${safeName}-${id}.log`);
+  writeFileSync(logFile, "");
+  headlessSurfaces.set(surface, { logFile, pid: null });
+  return surface;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runHeadlessCommand(surface: string, command: string): void {
+  const state = requireHeadlessSurface(surface);
+  const fd = openSync(state.logFile, "a");
+  try {
+    // detached → own session/process group: the child survives parent exit
+    // like a pane would, and closeSurface can kill the whole group.
+    const child = spawn("bash", ["-c", command], {
+      detached: true,
+      stdio: ["ignore", fd, fd],
+      cwd: process.cwd(),
+      env: process.env,
+    });
+    child.once("error", (error) => {
+      appendFileSync(state.logFile, `\n[pi-subagent] failed to spawn: ${error.message}\n`);
+    });
+    child.unref();
+    state.pid = child.pid ?? null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readHeadlessScreen(surface: string, lines: number): string {
+  const state = requireHeadlessSurface(surface);
+  let output = "";
+  try {
+    output = readFileSync(state.logFile, "utf8");
+  } catch {
+    output = "";
+  }
+  // A dead process with no completion sentinel means the subagent was killed
+  // before it could finish (the pane equivalent is a destroyed surface), so
+  // report the surface as gone instead of returning a forever-stale screen.
+  const alive = state.pid !== null && isProcessAlive(state.pid);
+  if (!alive && !/__SUBAGENT_DONE_\d+__/.test(output)) {
+    throw new Error(
+      `Headless subagent process is gone without a completion sentinel (log: ${state.logFile})`,
+    );
+  }
+  return tailLines(output, lines);
+}
+
+function closeHeadlessSurface(surface: string): void {
+  const state = headlessSurfaces.get(surface);
+  headlessSurfaces.delete(surface);
+  if (state?.pid && isProcessAlive(state.pid)) {
+    try {
+      process.kill(-state.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(state.pid, "SIGTERM");
+      } catch {
+        // Best effort — the process may have exited between the checks.
+      }
+    }
+  }
 }
 
 export function muxSetupHint(): string {
@@ -749,10 +913,15 @@ function createCmuxSplitSurface(
  * For zellij: chooses a tab-aware tiled or stacked placement.
  * For tmux/wezterm: falls back to split behavior.
  *
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm,
+ * `headless:1-ab12cd` for detached background processes).
  */
 export function createSurface(name: string): string {
-  const backend = getMuxBackend();
+  const backend = getSurfaceBackend();
+
+  if (backend === "headless") {
+    return createHeadlessSurface(name);
+  }
 
   if (backend === "cmux" && cmuxSubagentPane) {
     // Verify the pane still exists before adding a tab to it
@@ -817,6 +986,10 @@ export function createSurfaceSplit(
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
+  if (getSurfaceBackend() === "headless") {
+    return createHeadlessSurface(name);
+  }
+
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
@@ -1009,6 +1182,11 @@ export function renameWorkspace(title: string): void {
  * Send a command string to a pane and execute it.
  */
 export function sendCommand(surface: string, command: string): void {
+  if (isHeadlessSurface(surface)) {
+    runHeadlessCommand(surface, command);
+    return;
+  }
+
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
@@ -1041,6 +1219,10 @@ export function sendCommand(surface: string, command: string): void {
  * Send one Escape keypress to an active pane.
  */
 export function sendEscape(surface: string): void {
+  if (isHeadlessSurface(surface)) {
+    throw new Error("Cannot send Escape to a headless subagent (no terminal surface).");
+  }
+
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
@@ -1105,6 +1287,10 @@ export function sendLongCommand(
  * Read the screen contents of a pane (sync).
  */
 export function readScreen(surface: string, lines = 50): string {
+  if (isHeadlessSurface(surface)) {
+    return readHeadlessScreen(surface, lines);
+  }
+
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
@@ -1148,6 +1334,10 @@ export function readScreen(surface: string, lines = 50): string {
  * Read the screen contents of a pane (async).
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
+  if (isHeadlessSurface(surface)) {
+    return readHeadlessScreen(surface, lines);
+  }
+
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
@@ -1191,6 +1381,11 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  * Close a pane.
  */
 export function closeSurface(surface: string): void {
+  if (isHeadlessSurface(surface)) {
+    closeHeadlessSurface(surface);
+    return;
+  }
+
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
@@ -1246,8 +1441,29 @@ function interpretExitSidecar(data: any): PollResult {
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
+  // Fallback sidecar written by the launch-script EXIT trap (withExitSignal):
+  // the child stopped without calling subagent_done. Preserve its exit code.
+  if (data?.type === "exit") {
+    const code = Number.isInteger(data?.exitCode) ? data.exitCode : 0;
+    if (code === 0) return { reason: "done", exitCode: 0 };
+    return {
+      reason: "error",
+      exitCode: code,
+      errorMessage:
+        typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
+          ? data.errorMessage
+          : `Subagent process exited with code ${code} without signalling completion.`,
+    };
+  }
   return { reason: "done", exitCode: 0 };
 }
+
+/**
+ * How many consecutive polls the surface may be unreadable before we conclude
+ * the subagent is gone. Guards against transient mux read failures while still
+ * cleaning up when a pane is destroyed via SIGKILL (no EXIT trap can run).
+ */
+const SURFACE_GONE_GRACE_TICKS = 5;
 
 export const __pollForExitTest__ = { interpretExitSidecar };
 
@@ -1267,6 +1483,7 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  let surfaceGoneStreak = 0;
 
   for (;;) {
     if (signal.aborted) {
@@ -1301,8 +1518,11 @@ export async function pollForExit(
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
+      // Surface is readable → the subagent is still alive. Reset the strike count.
+      surfaceGoneStreak = 0;
     } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
+      // Surface may have been destroyed (pane closed, Ctrl-D, crash, SIGKILL).
+      // First give any bash EXIT-trap sidecar a chance to land…
       if (options.sessionFile) {
         try {
           const exitFile = `${options.sessionFile}.exit`;
@@ -1312,6 +1532,18 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+      // …otherwise, if the surface stays unreadable for the whole grace window
+      // with no sidecar, treat the subagent as gone so the parent stops waiting
+      // forever. Covers SIGKILL / hard pane destroy, where no trap can run.
+      surfaceGoneStreak++;
+      if (surfaceGoneStreak >= SURFACE_GONE_GRACE_TICKS) {
+        return {
+          reason: "error",
+          exitCode: 137,
+          errorMessage:
+            "Subagent surface disappeared (pane closed or process killed) before it signalled completion.",
+        };
       }
     }
 
