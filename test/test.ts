@@ -96,14 +96,18 @@ function createMockExtensionApi() {
   const registeredMessageRenderers: Array<any> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
+  const registeredHandlers = new Map<string, (event: any, ctx: any) => void>();
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
+    registeredHandlers,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(event: string, handler: (event: any, ctx: any) => void) {
+        registeredHandlers.set(event, handler);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -3073,5 +3077,42 @@ describe("repairWorkspaceEnv", () => {
     const env = { CMUX_WORKSPACE_ID: "dead-uuid" };
     assert.equal(repairWorkspaceEnv(env, undefined, live), undefined);
     assert.equal(env.CMUX_WORKSPACE_ID, "dead-uuid");
+describe("poll-abort generations across session lifecycle", () => {
+  const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+
+  function currentPollAbort(): AbortController {
+    return (globalThis as any)[POLL_ABORT_KEY] as AbortController;
+  }
+
+  it("arms a live poll-abort signal after a session switch", () => {
+    const { api, registeredHandlers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const shutdown = registeredHandlers.get("session_shutdown");
+    assert.ok(shutdown, "extension must register a session_shutdown handler");
+
+    const previousGeneration = currentPollAbort();
+    try {
+      // /new, /resume and /fork all emit session_shutdown but — unlike /reload —
+      // do NOT re-execute this module, so the handler is the only place that can
+      // arm the next generation.
+      shutdown!({ type: "session_shutdown", reason: "new" }, {} as any);
+
+      assert.equal(
+        previousGeneration.signal.aborted,
+        true,
+        "watchers from the session we just left must be aborted",
+      );
+      const nextGeneration = currentPollAbort();
+      assert.notEqual(nextGeneration, previousGeneration, "a fresh generation must be installed");
+      assert.equal(
+        nextGeneration.signal.aborted,
+        false,
+        "a watcher created after the switch must not be born aborted — " +
+          "pollForExit would throw on its first tick and the result would never be delivered",
+      );
+    } finally {
+      (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+    }
   });
 });
