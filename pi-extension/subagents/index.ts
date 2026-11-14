@@ -270,11 +270,38 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
         file.replace(/\.md$/, ""),
       );
       if (!parsed) continue;
-      agents.set(parsed.name, { ...parsed, source });
+      // dirs run lowest→highest precedence, so merge onto any existing entry:
+      // a higher-precedence file overrides only the fields it sets (see
+      // mergeAgentDefinition), inheriting the rest. Source tracks the winner.
+      const existing = agents.get(parsed.name);
+      const merged = existing ? mergeAgentDefinition(existing, parsed) : parsed;
+      agents.set(parsed.name, { ...merged, source });
     }
   }
 
   return [...agents.values()];
+}
+
+/**
+ * Apply an override agent definition on top of a base, field by field: only the
+ * fields the override actually sets win; everything else is inherited. This lets
+ * a user drop a 2-line `~/.pi/agent/agents/<name>.md` that overrides just
+ * `model:` while keeping the bundled role body, tools, and description.
+ *
+ * Note: `disableModelInvocation` is always concrete (never undefined) after
+ * parsing, so it takes the highest-precedence file's value — harmless, since it
+ * defaults to false and no bundled agent enables it.
+ */
+function mergeAgentDefinition(
+  base: AgentDefinition,
+  override: AgentDefinition,
+): AgentDefinition {
+  const result: AgentDefinition = { ...base };
+  for (const key of Object.keys(override) as (keyof AgentDefinition)[]) {
+    const value = override[key];
+    if (value !== undefined) (result as Record<string, unknown>)[key] = value;
+  }
+  return result;
 }
 
 function resolveSubagentPaths(
@@ -358,19 +385,25 @@ function resolveEffectiveInteractive(
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const configDir = getAgentConfigDir();
+  // Lowest precedence first; each higher-precedence file overrides only the
+  // fields it sets (see mergeAgentDefinition), inheriting the rest — so a tiny
+  // ~/.pi/agent/agents/<name>.md can override just `model:` and keep the bundled
+  // body/tools. (First-wins previously discarded the bundled def wholesale.)
   const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
-    join(configDir, "agents", `${agentName}.md`),
     join(getBundledAgentsDir(), `${agentName}.md`),
+    join(configDir, "agents", `${agentName}.md`),
+    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
   ];
 
+  let merged: AgentDefinition | null = null;
   for (const p of paths) {
     if (!existsSync(p)) continue;
     const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName);
-    if (parsed) return parsed;
+    if (!parsed) continue;
+    merged = merged ? mergeAgentDefinition(merged, parsed) : parsed;
   }
 
-  return null;
+  return merged;
 }
 
 function formatElapsed(seconds: number): string {
@@ -898,6 +931,7 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  mergeAgentDefinition,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
