@@ -988,24 +988,29 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
-    for (const name of ["scout", "worker", "reviewer"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous)`,
-      );
-    }
+  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", async () => {
+    // Isolate from the real ~/.pi/agent/agents and cwd/.pi/agents so this asserts
+    // the BUNDLED defs, not whatever the developer has installed locally (empty
+    // project+global dirs make loadAgentDefaults fall through to the bundled dir).
+    await withIsolatedAgentEnv(async () => {
+      for (const name of ["scout", "worker", "reviewer"]) {
+        const defs = testApi.loadAgentDefaults(name);
+        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+        assert.equal(
+          testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
+          false,
+          `${name} should resolve as non-interactive (autonomous)`,
+        );
+      }
 
-    const planner = testApi.loadAgentDefaults("planner");
-    assert.ok(planner, "expected bundled planner to be discoverable");
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
-      true,
-      "planner should resolve as interactive (no auto-exit)",
-    );
+      const planner = testApi.loadAgentDefaults("planner");
+      assert.ok(planner, "expected bundled planner to be discoverable");
+      assert.equal(
+        testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
+        true,
+        "planner should resolve as interactive (no auto-exit)",
+      );
+    });
   });
 
   it("merges a global override onto the bundled def: override model, inherit body", async () => {
